@@ -1,0 +1,6 @@
+
+*.ipch
+src/Debug/
+src/Release/
+src/.vs/
+src/CarND-Path-Planning-Project.vcxproj.user
