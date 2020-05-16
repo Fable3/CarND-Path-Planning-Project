@@ -197,7 +197,7 @@ struct Map
 	*/	
 	}
 
-	bool lane_matching(double x, double y, double &out_s, double &out_d, int &out_lane) // only works around car
+	bool lane_matching(double x, double y, double &out_s, double &out_d, int &out_lane, int *p_next_wp_id = NULL, int lane_mask = 0xFFFF) // only works around car
 	{
 		int search_direction = 0; // any
 		Point p(x, y);
@@ -215,6 +215,7 @@ struct Map
 			bool search_improved = false;
 			for (int lane = 0; lane < NUM_LANES; lane++)
 			{
+				if (((1 << lane)&lane_mask) == 0) continue;
 				double distsq = distancesq_pt_seg(p,
 					get_waypoint(current_wp - 1).lane_center[lane],
 					get_waypoint(current_wp).lane_center[lane],
@@ -232,6 +233,7 @@ struct Map
 					if (snom < 0) d = -d; // signed distance
 					out_d = d + get_lane_center_offset(lane);
 					out_lane = lane;
+					if (p_next_wp_id != NULL) *p_next_wp_id = current_wp;
 				}
 				if (rnom == 0) // go towards prev
 				{
@@ -386,7 +388,7 @@ int main() {
 			  }
 		  }
 		  double car_length = 7;
-		  double safety_distance = 0;
+		  double safety_distance = 5;
 		  double max_speed = 44.4;//22.2;
 		  if (next_car_id != -1)
 		  {
@@ -394,14 +396,18 @@ int main() {
 			  double s, d;
 			  int lane;
 			  map.lane_matching(car.x, car.y, s, d, lane);
-			  printf("next car telemetry (%.2f, %.2f) calculated (%.2f, %.2f) diff %.2f in lane %d\n", car.s, car.d, s + ego_s, d, fabs(s + ego_s - car.s), lane);
+			  double cartesian_dist = distance(car.x, car.y, ego_x, ego_y);
+			  printf("next car telemetry (%.2f, %.2f) calculated (%.2f, %.2f) diff %.2f xy_dist: %.2f dist: %.2f in lane %d\n",
+				  car.s, car.d, s + ego_s, d, fabs(s + ego_s - car.s), s, cartesian_dist, lane);
 			  ego_s = 0;
 			  next_s = s;
 		  }
-		  if (next_car_id != -1 && ego_s+car_length>next_s)
+		  if (next_car_id != -1 && ego_s+car_length+safety_distance>next_s)
 		  {
 			  auto &car = SensorFusionCars[next_car_id];
-			  max_speed = std::min(max_speed, sqrt(car.vx*car.vx + car.vy*car.vy));
+			  double t_to_reach_optimal_distance = 1; // sec
+			  double excess_distance = ego_s + car_length - next_s; // negative when approaching
+			  max_speed = std::min(max_speed, sqrt(car.vx*car.vx + car.vy*car.vy)) - excess_distance / t_to_reach_optimal_distance;
 		  }
 
 
@@ -442,7 +448,7 @@ int main() {
 		  }
 		  trajectory.add_point(pos_x, pos_y);
 		  
-		  int nNextWaypoint = NextWaypoint(pos_x, pos_y, angle, map_waypoints_x, map_waypoints_y);
+		  /*int nNextWaypoint = NextWaypoint(pos_x, pos_y, angle, map_waypoints_x, map_waypoints_y);
 		  int nPrevWaypoint = nNextWaypoint == 0 ? map_waypoints_x.size() - 1 : nNextWaypoint - 1;
 		  double rnom, rdenom, snom;
 		  double distsq = distancesq_pt_seg(
@@ -470,7 +476,24 @@ int main() {
 			  trajectory.add_point(map_waypoints_x[nNextWaypoint]+dx, map_waypoints_y[nNextWaypoint]+dy);
 			  if (trajectory.total_dist > 50) break;
 			  nNextWaypoint= (nNextWaypoint+1)%map_waypoints_x.size();
+		  }*/
+		  int nNextWaypoint = map.reference_waypoint_id;
+		  int ego_lane = 2;
+		  // skip next waypoint if it's between car pos and end of fixed trajectory head
+		  {
+			  double s, d;
+			  int lane;
+			  map.lane_matching(pos_x, pos_y, s, d, lane, &nNextWaypoint, 1<<ego_lane);
 		  }
+		  //if (map.reference_waypoint_ratio[ego_lane] > 0.9) nNextWaypoint++; // prevent flukes
+
+		  for (int i = 0; i < 50 - path_size; ++i) {
+			  Point p = map.get_waypoint(nNextWaypoint).lane_center[ego_lane];
+			  trajectory.add_point(p.x, p.y);
+			  if (trajectory.total_dist > 50) break;
+			  nNextWaypoint = (nNextWaypoint + 1) % map_waypoints_x.size();
+		  }
+
 		  double dist_total = 0;
 		  double dist_step = max_speed/50;
 		  for (int i = 1; i < trajectory.waypoints.size(); i++)
