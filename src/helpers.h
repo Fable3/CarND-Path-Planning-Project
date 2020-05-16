@@ -154,4 +154,144 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s,
   return {x,y};
 }
 
+
+
+
+struct Point
+{
+	double x, y;
+	Point() { x = y = 0; }
+	Point(double _x, double _y) :x(_x), y(_y) {}
+	Point operator-(Point B) {
+		return Point(x - B.x, y - B.y);
+	}
+	Point operator+(Point B) {
+		return Point(x + B.x, y + B.y);
+	}
+	double length() {
+		return sqrt(x * x + y * y);
+	}
+	double lengthsq() {
+		return x * x + y * y;
+	}
+};
+
+double distancesq_pt_pt(Point p, Point A)
+{
+	return (p.x - A.x)*(p.x - A.x) + (p.y - A.y)*(p.y - A.y);
+}
+
+double distancesq_pt_seg(Point p, Point A, Point B,
+	double &_rnom,
+	double &_rdenom,
+	double &_snom)
+{
+	_rnom = 0;
+	_rdenom = 1;
+	_snom = 0;
+
+	//if start==end, then use pt distance
+	if (A.x == B.x && A.y == B.y)
+		return distancesq_pt_pt(A, B);
+
+	//otherwise, we use comp.graphics.algorithms Frequently Asked Questions method
+
+	/*(1)     	      AC dot AB
+				r = ---------
+						||AB||^2
+		r has the following meaning:
+		r=0 P = A
+		r=1 P = B
+		r<0 P is on the backward extension of AB
+		r>1 P is on the forward extension of AB
+		0<r<1 P is interior to AB
+	*/
+
+	const double rdenom = distancesq_pt_pt(A, B);
+	const double pdx = p.x - A.x, dx = B.x - A.x;
+	const double pdy = p.y - A.y, dy = B.y - A.y;
+	const double rnom1 = pdx * dx;
+	const double rnom2 = pdy * dy;
+	const double rnom = rnom1 + rnom2;
+	_rdenom = rdenom;
+
+	const double snom1 = pdx * dy;
+	const double snom2 = pdy * dx;
+	const double snom = snom1 - snom2;
+	_snom = snom;
+
+	if (rnom < -1)
+	{
+		_rnom = 0;
+		return distancesq_pt_pt(p, A);
+	}
+	if (rnom > rdenom)
+	{
+		_rnom = rdenom;
+		return distancesq_pt_pt(p, B);
+	}
+	_rnom = rnom;
+
+	/*(2)
+			(Ay-Cy)(Bx-Ax)-(Ax-Cx)(By-Ay)
+		s = -----------------------------
+						L^2
+
+		Then the distance from C to P = |s|*L.
+
+	*/
+
+	return snom * snom / rdenom;
+}
+
+
+vector<double> JMT(vector<double> &start, vector<double> &end, double T) {
+	/**
+	 * Calculate the Jerk Minimizing Trajectory that connects the initial state
+	 * to the final state in time T.
+	 *
+	 * @param start - the vehicles start location given as a length three array
+	 *   corresponding to initial values of [s, s_dot, s_double_dot]
+	 * @param end - the desired end state for vehicle. Like "start" this is a
+	 *   length three array.
+	 * @param T - The duration, in seconds, over which this maneuver should occur.
+	 *
+	 * @output an array of length 6, each value corresponding to a coefficent in
+	 *   the polynomial:
+	 *   s(t) = a_0 + a_1 * t + a_2 * t**2 + a_3 * t**3 + a_4 * t**4 + a_5 * t**5
+	 *
+	 * EXAMPLE
+	 *   > JMT([0, 10, 0], [10, 10, 0], 1)
+	 *     [0.0, 10.0, 0.0, 0.0, 0.0, 0.0]
+	 */
+	using std::vector;
+	using Eigen::MatrixXd;
+	using Eigen::VectorXd;
+
+	MatrixXd A = MatrixXd(3, 3);
+	A << T * T*T, T*T*T*T, T*T*T*T*T,
+		3 * T*T, 4 * T*T*T, 5 * T*T*T*T,
+		6 * T, 12 * T*T, 20 * T*T*T;
+
+	MatrixXd B = MatrixXd(3, 1);
+	B << end[0] - (start[0] + start[1] * T + .5*start[2] * T*T),
+		end[1] - (start[1] + start[2] * T),
+		end[2] - start[2];
+
+	MatrixXd Ai = A.inverse();
+
+	MatrixXd C = Ai * B;
+
+	vector <double> result = { start[0], start[1], .5*start[2] };
+
+	for (int i = 0; i < C.size(); ++i) {
+		result.push_back(C.data()[i]);
+	}
+
+	return result;
+}
+
+
+
+
 #endif  // HELPERS_H

@@ -1,4 +1,6 @@
 #define _USE_MATH_DEFINES
+#define _CRT_SECURE_NO_WARNINGS
+#pragma warning(disable: 4251)
 #include <uWS/uWS.h>
 #include <fstream>
 #include <iostream>
@@ -7,6 +9,7 @@
 #include <stdio.h>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
+#include "Eigen-3.3/Eigen/LU"
 #include "helpers.h"
 #include "json.hpp"
 #include "spline.h"
@@ -16,79 +19,14 @@ using nlohmann::json;
 using std::string;
 using std::vector;
 
-struct Point
-{
-	double x, y;
-	Point() { x = y = 0; }
-	Point(double _x, double _y) :x(_x), y(_y) {}
-};
+#define NUM_LANES 3
 
-double distancesq_pt_pt(Point p, Point A)
+void error_condition(const char *filename, int line, const char *text)
 {
-	return (p.x - A.x)*(p.x - A.x) + (p.y - A.y)*(p.y - A.y);
+	std::cerr << "Assert failed in " << filename << " line " << line << ": " << text << std::endl;
 }
-double distancesq_pt_seg(Point p, Point A, Point B,
-	double &_rnom,
-	double &_rdenom,
-	double &_snom)
-{
-	_rnom = 0;
-	_rdenom = 1;
-	_snom = 0;
-
-	//if start==end, then use pt distance
-	if (A.x == B.x && A.y == B.y)
-		return distancesq_pt_pt(A, B);
-
-	//otherwise, we use comp.graphics.algorithms Frequently Asked Questions method
-
-	/*(1)     	      AC dot AB
-				r = ---------
-						||AB||^2
-		r has the following meaning:
-		r=0 P = A
-		r=1 P = B
-		r<0 P is on the backward extension of AB
-		r>1 P is on the forward extension of AB
-		0<r<1 P is interior to AB
-	*/
-
-	const double rdenom = distancesq_pt_pt(A, B);
-	const double pdx = p.x - A.x, dx = B.x - A.x;
-	const double pdy = p.y - A.y, dy = B.y - A.y;
-	const double rnom1 = pdx * dx;
-	const double rnom2 = pdy * dy;
-	const double rnom = rnom1 + rnom2;
-	_rdenom = rdenom;
-
-	const double snom1 = pdx * dy;
-	const double snom2 = pdy * dx;
-	const double snom = snom1 - snom2;
-	_snom = snom;
-
-	if (rnom < -1)
-	{
-		_rnom = 0;
-		return distancesq_pt_pt(p, A);
-	}
-	if (rnom > rdenom)
-	{
-		_rnom = rdenom;
-		return distancesq_pt_pt(p, B);
-	}
-	_rnom = rnom;
-
-	/*(2)
-			(Ay-Cy)(Bx-Ax)-(Ax-Cx)(By-Ay)
-		s = -----------------------------
-						L^2
-
-		Then the distance from C to P = |s|*L.
-
-	*/
-
-	return snom * snom / rdenom;
-}
+#undef assert
+#define assert(a) if(!(a)) error_condition (__FILE__, __LINE__, #a)
 
 struct Car
 {
@@ -109,6 +47,230 @@ struct TrajectoryBuilder
 			total_dist += distance(prev_p.x, prev_p.y, x, y);
 		}
 		waypoints.push_back(Point(x, y));
+	}
+};
+
+struct Map
+{
+	struct Waypoint
+	{
+		Point ref; // reference pos
+		Point lane_center[NUM_LANES]; // lane centerline position with averaged normalized vectors at joints
+		double len;
+		double nx, ny; //normal vector (same for ref and all centerlines)
+	};
+	vector<Waypoint> waypoints;
+	double get_lane_center_offset(int lane)
+	{
+		double lane_width = 4.0;
+		return lane_width * (lane + 0.5);
+	}
+	void Init(const vector<double> &map_waypoints_x,
+		const vector<double> &map_waypoints_y)
+	{
+		waypoints.resize(map_waypoints_x.size());
+		// init reference line
+		for (int i = 0; (int)i < waypoints.size(); i++)
+		{
+			auto &wp = waypoints[i];
+			wp.ref.x = map_waypoints_x[i];
+			wp.ref.y = map_waypoints_y[i];
+		}
+		// init normal vectors
+		for (int i = 0; (int)i < waypoints.size(); i++)
+		{
+			auto &wp = waypoints[i];
+			auto prev_wp = get_waypoint(i - 1);
+			Point delta = wp.ref - prev_wp.ref;
+			double delta_len = delta.length();
+			wp.nx = delta.y/delta_len;
+			wp.ny = -delta.x/ delta_len;
+		}
+		// create centerlines from averaged normals
+		for (int i = 0; (int)i < waypoints.size(); i++)
+		{
+			auto &wp = waypoints[i];
+			auto next_wp = get_waypoint(i + 1);
+			double nx = (wp.nx + next_wp.nx) / 2;
+			double ny = (wp.ny + next_wp.ny) / 2;
+			for (int r = 0; r < 3; r++)
+			{
+				double offset = get_lane_center_offset(r);
+				wp.lane_center[r].x = wp.ref.x + nx * offset;
+				wp.lane_center[r].y = wp.ref.y + ny * offset;
+			}
+		}
+	}
+	int reference_waypoint_id; 
+	double reference_waypoint_ratio[NUM_LANES]; // 's' calculation zero point for each lane, 0: at prev waypoint, 1: at ref waypoint
+	Waypoint &get_waypoint(int idx)
+	{
+		return waypoints[(idx + waypoints.size()) % waypoints.size()];
+	}
+	double get_lane_length(int wp, int lane)
+	{
+		Point diff = get_waypoint(wp).lane_center[lane] - get_waypoint(wp - 1).lane_center[lane];
+		return diff.length();
+	}
+	void init_reference_waypoint(double x, double y)
+	{
+		int closest_wp = 0;
+		Point p(x, y);
+		double closest_distsq = (get_waypoint(0).ref - p).lengthsq();
+		for (int i = 1; i < (int)waypoints.size(); i++)
+		{
+			double d = (get_waypoint(i).ref - p).lengthsq();
+			if (d < closest_distsq)
+			{
+				closest_wp = i;
+				closest_distsq = d;
+			}
+		}
+		// choose waypoint segment by distance to ref line
+		double rnom, snom, rdenom;
+		double distsq_ref[2];
+		for (int next_or_prev = 0; next_or_prev < 2; next_or_prev++)
+		{
+			distsq_ref[next_or_prev] = distancesq_pt_seg(p,
+				get_waypoint(closest_wp + next_or_prev - 1).ref,
+				get_waypoint(closest_wp + next_or_prev).ref,
+				rnom, rdenom, snom);
+		}
+		if (distsq_ref[1] < distsq_ref[0])
+		{
+			// next segment is closer
+			closest_wp++;
+		}
+		else if (distsq_ref[1] == distsq_ref[0])
+		{
+			// same distance, so the point is in the triangle around the averaged normal of the 2 segments, decide which side
+			Point avg_normal((get_waypoint(closest_wp - 1).nx + get_waypoint(closest_wp).nx) / 2,
+				(get_waypoint(closest_wp - 1).ny + get_waypoint(closest_wp).ny) / 2);
+			Point delta_p = p - get_waypoint(closest_wp).ref;
+			double dotp = avg_normal.x*delta_p.x + avg_normal.y*delta_p.y;
+			if (dotp > 0)
+			{
+				// 'delta_p' vector is after the averaged normal, so it passed the junction of the 2 waypoint segments
+				closest_wp++;
+			}
+		}
+
+		reference_waypoint_id = closest_wp;
+
+		// create reference (0) 's' point on each lane centerline
+		for (int lane = 0; lane < NUM_LANES; lane++)
+		{
+			double distsq = distancesq_pt_seg(p,
+				get_waypoint(closest_wp- 1).lane_center[lane],
+				get_waypoint(closest_wp).lane_center[lane],
+				rnom, rdenom, snom);
+			reference_waypoint_ratio[lane] = rnom / rdenom;
+		}
+/*
+
+		int min_wp = closest_wp;
+		double min_dist_sq = 1000*1000;
+		int min_lane = 0;
+		double min_rnom=0, min_snom=0, min_rdenom=1;
+		for (int next_or_prev = 0; next_or_prev < 2; next_or_prev++)
+		{
+			for (int lane = 0; lane < NUM_LANES; lane++)
+			{
+				double rnom[2][NUM_LANES], snom[2][NUM_LANES], rdenom[2][NUM_LANES];
+				double dist_sq[2][NUM_LANES];
+
+				dist_sq[next_or_prev][lane] = distancesq_pt_seg(p,
+					get_waypoint(closest_wp + next_or_prev - 1).lane_center[lane],
+					get_waypoint(closest_wp + next_or_prev).lane_center[lane],
+					rnom[next_or_prev][lane], rdenom[next_or_prev][lane], snom[next_or_prev][lane]);
+				if (dist_sq < min_dist_sq)
+				{
+					min_dist_sq = dist_sq;
+					min_snom = snom;
+					min_rnom = rnom;
+					min_rdenom = rdenom;
+					min_wp = closest_wp + next_or_prev;
+					min_lane = lane;
+				}
+			}
+		}
+	*/	
+	}
+
+	bool lane_matching(double x, double y, double &out_s, double &out_d, int &out_lane) // only works around car
+	{
+		int search_direction = 0; // any
+		Point p(x, y);
+		bool stop_search = false;
+		int current_wp = reference_waypoint_id;
+		double sum_s[NUM_LANES] = { 0, 0, 0 };
+		double s_ratio[NUM_LANES]; // ratio shift, reference ratio at start, 1 after going backwards, 0 after forward
+		for (int i = 0; i < NUM_LANES; i++) s_ratio[i] = reference_waypoint_ratio[i];
+
+		double best_distsq = 1000 * 1000;
+		bool found_any = false;
+		for (;;)
+		{
+			double rnom, snom, rdenom;
+			bool search_improved = false;
+			for (int lane = 0; lane < NUM_LANES; lane++)
+			{
+				double distsq = distancesq_pt_seg(p,
+					get_waypoint(current_wp - 1).lane_center[lane],
+					get_waypoint(current_wp).lane_center[lane],
+					rnom, rdenom, snom);
+				if (distsq < best_distsq)
+				{
+					best_distsq = distsq;
+					search_improved = true;
+					found_any = true;
+					double ratio_from_start = rnom / rdenom;
+					double r_mod = ratio_from_start - s_ratio[lane];
+					double seg_len = get_lane_length(current_wp, lane); // same as sqrt(rdenom)
+					out_s = sum_s[lane] + seg_len * r_mod;
+					double d = sqrt(distsq);
+					if (snom < 0) d = -d; // signed distance
+					out_d = d + get_lane_center_offset(lane);
+					out_lane = lane;
+				}
+				if (rnom == 0) // go towards prev
+				{
+					if (search_direction == 1) stop_search = true; // change direction
+					search_direction = -1;
+				}
+				else if (rnom == rdenom)
+				{
+					if (search_direction == -1) stop_search = true; // change direction
+					search_direction = 1;
+				}
+				else
+				{
+					// projection is on the segment, stop search
+					stop_search = true;
+				}
+			}
+			if (!search_improved || stop_search) break;
+			assert(search_direction != 0);
+			if (search_direction > 0)
+			{
+				for (int lane = 0; lane < NUM_LANES; lane++)
+				{
+					sum_s[lane] += (1 - s_ratio[lane])*get_lane_length(current_wp, lane);
+					s_ratio[lane] = 0; // at start of next waypoint, ratio shift is 0
+				}
+				current_wp++;
+			}
+			else
+			{
+				for (int lane = 0; lane < NUM_LANES; lane++)
+				{
+					sum_s[lane] -= s_ratio[lane]*get_lane_length(current_wp, lane);
+					s_ratio[lane] = 1; // because we're at the end of the previous waypoint segment
+				}
+				current_wp--;
+			}
+		}
+		return found_any;
 	}
 };
 
@@ -148,9 +310,10 @@ int main() {
     map_waypoints_dx.push_back(d_x);
     map_waypoints_dy.push_back(d_y);
   }
+  Map map;
+  map.Init(map_waypoints_x, map_waypoints_y);
 
-
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
+  h.onMessage([&map, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
                &map_waypoints_dx,&map_waypoints_dy]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
@@ -170,12 +333,12 @@ int main() {
           // j[1] is the data JSON object
           
           // Main car's localization Data
-          double car_x = j[1]["x"];
-          double car_y = j[1]["y"];
-          double car_s = j[1]["s"];
-          double car_d = j[1]["d"];
-          double car_yaw = j[1]["yaw"];
-          double car_speed = j[1]["speed"];
+          double ego_x = j[1]["x"];
+          double ego_y = j[1]["y"];
+          double ego_s = j[1]["s"];
+          double ego_d = j[1]["d"];
+          double ego_yaw = j[1]["yaw"];
+          double ego_speed = j[1]["speed"];
 
 		  //vector<double> calc_xy = getXY(car_s, car_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
 		  //printf("%.2f, %.2f calc %.2f %.2f\n", car_x, car_y, calc_xy[0], calc_xy[1]);
@@ -191,6 +354,9 @@ int main() {
           // Sensor Fusion Data, a list of all other cars on the same side 
           //   of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
+
+		  map.init_reference_waypoint(ego_x, ego_y);
+
 		  for (int i = 0; i < (int)sensor_fusion.size(); i++)
 		  {
 			  auto car_data = sensor_fusion[i];
@@ -204,6 +370,40 @@ int main() {
 			  car.s = car_data[5];
 			  car.d = car_data[6];
 		  }
+
+		  int next_car_id = -1;
+		  double next_s = 0;
+		  for (auto &p : SensorFusionCars)
+		  {
+			  auto &car = p.second;
+			  if (car.s > ego_s && fabs(car.d - ego_d) < 2)
+			  {
+				  if (next_car_id == -1 || next_s > car.s)
+				  {
+					  next_car_id = car.id;
+					  next_s = car.s;
+				  }
+			  }
+		  }
+		  double car_length = 7;
+		  double safety_distance = 0;
+		  double max_speed = 44.4;//22.2;
+		  if (next_car_id != -1)
+		  {
+			  auto &car = SensorFusionCars[next_car_id];
+			  double s, d;
+			  int lane;
+			  map.lane_matching(car.x, car.y, s, d, lane);
+			  printf("next car telemetry (%.2f, %.2f) calculated (%.2f, %.2f) diff %.2f in lane %d\n", car.s, car.d, s + ego_s, d, fabs(s + ego_s - car.s), lane);
+			  ego_s = 0;
+			  next_s = s;
+		  }
+		  if (next_car_id != -1 && ego_s+car_length>next_s)
+		  {
+			  auto &car = SensorFusionCars[next_car_id];
+			  max_speed = std::min(max_speed, sqrt(car.vx*car.vx + car.vy*car.vy));
+		  }
+
 
           json msgJson;
 
@@ -228,9 +428,9 @@ int main() {
 
 		  TrajectoryBuilder trajectory;
 		  if (path_size == 0) {
-			  pos_x = car_x;
-			  pos_y = car_y;
-			  angle = deg2rad(car_yaw);
+			  pos_x = ego_x;
+			  pos_y = ego_y;
+			  angle = deg2rad(ego_yaw);
 		  }
 		  else {
 			  pos_x = previous_path_x[path_size - 1];
@@ -253,7 +453,7 @@ int main() {
 		  double wp_len = distance(map_waypoints_x[nPrevWaypoint], map_waypoints_y[nPrevWaypoint],
 			  map_waypoints_x[nNextWaypoint], map_waypoints_y[nNextWaypoint]);
 		  double wp_dist = rnom < 0 ? 0 : rnom >= rdenom ? wp_len : wp_len * rnom / rdenom;
-		  printf("next waypoint dist: s = %.2f d = %.2f\n", wp_dist, sqrt(distsq));
+		  //printf("next waypoint dist: s = %.2f d = %.2f\n", wp_dist, sqrt(distsq));
 		  if (wp_dist < 2) // fix for very close waypoint to pos
 		  {
 			  nNextWaypoint = (nNextWaypoint + 1) % map_waypoints_x.size();
@@ -272,7 +472,7 @@ int main() {
 			  nNextWaypoint= (nNextWaypoint+1)%map_waypoints_x.size();
 		  }
 		  double dist_total = 0;
-		  double dist_step = 0.9;
+		  double dist_step = max_speed/50;
 		  for (int i = 1; i < trajectory.waypoints.size(); i++)
 		  {
 			  double x = trajectory.waypoints[i].x;
