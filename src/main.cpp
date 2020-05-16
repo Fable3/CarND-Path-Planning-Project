@@ -166,35 +166,6 @@ struct Map
 				rnom, rdenom, snom);
 			reference_waypoint_ratio[lane] = rnom / rdenom;
 		}
-/*
-
-		int min_wp = closest_wp;
-		double min_dist_sq = 1000*1000;
-		int min_lane = 0;
-		double min_rnom=0, min_snom=0, min_rdenom=1;
-		for (int next_or_prev = 0; next_or_prev < 2; next_or_prev++)
-		{
-			for (int lane = 0; lane < NUM_LANES; lane++)
-			{
-				double rnom[2][NUM_LANES], snom[2][NUM_LANES], rdenom[2][NUM_LANES];
-				double dist_sq[2][NUM_LANES];
-
-				dist_sq[next_or_prev][lane] = distancesq_pt_seg(p,
-					get_waypoint(closest_wp + next_or_prev - 1).lane_center[lane],
-					get_waypoint(closest_wp + next_or_prev).lane_center[lane],
-					rnom[next_or_prev][lane], rdenom[next_or_prev][lane], snom[next_or_prev][lane]);
-				if (dist_sq < min_dist_sq)
-				{
-					min_dist_sq = dist_sq;
-					min_snom = snom;
-					min_rnom = rnom;
-					min_rdenom = rdenom;
-					min_wp = closest_wp + next_or_prev;
-					min_lane = lane;
-				}
-			}
-		}
-	*/	
 	}
 
 	bool lane_matching(double x, double y, double &out_s, double &out_d, int &out_lane, int *p_next_wp_id = NULL, int lane_mask = 0xFFFF) // only works around car
@@ -315,8 +286,7 @@ int main() {
   Map map;
   map.Init(map_waypoints_x, map_waypoints_y);
 
-  h.onMessage([&map, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
-               &map_waypoints_dx,&map_waypoints_dy]
+  h.onMessage([&map]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -342,11 +312,7 @@ int main() {
           double ego_yaw = j[1]["yaw"];
           double ego_speed = j[1]["speed"];
 
-		  //vector<double> calc_xy = getXY(car_s, car_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-		  //printf("%.2f, %.2f calc %.2f %.2f\n", car_x, car_y, calc_xy[0], calc_xy[1]);
-		  //printf("XY calc diff %.2f, %.2f\n", car_x-calc_xy[0], car_y-calc_xy[1]);
-
-          // Previous path data given to the Planner
+		  // Previous path data given to the Planner
           auto previous_path_x = j[1]["previous_path_x"];
           auto previous_path_y = j[1]["previous_path_y"];
           // Previous path's end s and d values 
@@ -417,7 +383,7 @@ int main() {
           vector<double> next_y_vals;
 
           /**
-           * TODO: define a path made up of (x,y) points that the car will visit
+           *  define a path made up of (x,y) points that the car will visit
            *   sequentially every .02 seconds
            */
 
@@ -448,35 +414,6 @@ int main() {
 		  }
 		  trajectory.add_point(pos_x, pos_y);
 		  
-		  /*int nNextWaypoint = NextWaypoint(pos_x, pos_y, angle, map_waypoints_x, map_waypoints_y);
-		  int nPrevWaypoint = nNextWaypoint == 0 ? map_waypoints_x.size() - 1 : nNextWaypoint - 1;
-		  double rnom, rdenom, snom;
-		  double distsq = distancesq_pt_seg(
-			  Point(pos_x, pos_y),
-			  Point(map_waypoints_x[nNextWaypoint], map_waypoints_y[nNextWaypoint]),
-			  Point(map_waypoints_x[nPrevWaypoint], map_waypoints_y[nPrevWaypoint]),
-			  rnom, rdenom, snom);
-		  double wp_len = distance(map_waypoints_x[nPrevWaypoint], map_waypoints_y[nPrevWaypoint],
-			  map_waypoints_x[nNextWaypoint], map_waypoints_y[nNextWaypoint]);
-		  double wp_dist = rnom < 0 ? 0 : rnom >= rdenom ? wp_len : wp_len * rnom / rdenom;
-		  //printf("next waypoint dist: s = %.2f d = %.2f\n", wp_dist, sqrt(distsq));
-		  if (wp_dist < 2) // fix for very close waypoint to pos
-		  {
-			  nNextWaypoint = (nNextWaypoint + 1) % map_waypoints_x.size();
-		  }
-		  
-		  for (int i = 0; i < 50 - path_size; ++i) {
-			  int nPrevWaypoint = nNextWaypoint == 0 ? map_waypoints_x.size()-1: nNextWaypoint - 1;
-			  double heading = atan2((map_waypoints_y[nNextWaypoint] - map_waypoints_y[nPrevWaypoint]),
-				  (map_waypoints_x[nNextWaypoint] - map_waypoints_x[nPrevWaypoint]));
-			  double perp_heading = heading - pi() / 2;
-			  double d = 10;
-			  double dx = d * cos(perp_heading);
-			  double dy = d * sin(perp_heading);
-			  trajectory.add_point(map_waypoints_x[nNextWaypoint]+dx, map_waypoints_y[nNextWaypoint]+dy);
-			  if (trajectory.total_dist > 50) break;
-			  nNextWaypoint= (nNextWaypoint+1)%map_waypoints_x.size();
-		  }*/
 		  int nNextWaypoint = map.reference_waypoint_id;
 		  int ego_lane = 2;
 		  // skip next waypoint if it's between car pos and end of fixed trajectory head
@@ -491,7 +428,7 @@ int main() {
 			  Point p = map.get_waypoint(nNextWaypoint).lane_center[ego_lane];
 			  trajectory.add_point(p.x, p.y);
 			  if (trajectory.total_dist > 50) break;
-			  nNextWaypoint = (nNextWaypoint + 1) % map_waypoints_x.size();
+			  nNextWaypoint = (nNextWaypoint + 1) % map.waypoints.size();
 		  }
 
 		  double dist_total = 0;
@@ -535,20 +472,6 @@ int main() {
 			  }
 			  fclose(fLog);
 		  }
-
-		  /* Wiggly 
-		  static int counter = 0;
-		  counter++;
-		  double dist_inc = 0.5;
-		  double angle_inc = (pi() / 100)*sin(counter/100.0);
-		  for (int i = 0; i < 50 - path_size; ++i) {
-			  next_x_vals.push_back(pos_x + (dist_inc)*cos(angle + (i + 1)*angle_inc));
-			  next_y_vals.push_back(pos_y + (dist_inc)*sin(angle + (i + 1)*angle_inc));
-			  pos_x += (dist_inc)*cos(angle + (i + 1)*angle_inc);
-			  pos_y += (dist_inc)*sin(angle + (i + 1)*angle_inc);
-		  }*/
-
-		  
 
 
           msgJson["next_x"] = next_x_vals;
