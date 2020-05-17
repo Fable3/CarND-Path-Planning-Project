@@ -28,12 +28,24 @@ void error_condition(const char *filename, int line, const char *text)
 #undef assert
 #define assert(a) if(!(a)) error_condition (__FILE__, __LINE__, #a)
 
+double relaxed_jerk = 5; // m/s^3
+double relaxed_acc = 5; // m/s^2
+double maximum_jerk = 10;
+double maximum_acc = 10;
+
 struct Car
 {
+	// input
 	int id;
-	double x, y, vx, vy, s, d;
+	double x, y, vx, vy;
+	
+	// calculated:
+	double s, d;
+	double acc_x, acc_y;
+	double vs, vd;
+	int lane;
 };
-std::map<int, Car> SensorFusionCars;
+
 
 struct TrajectoryBuilder
 {
@@ -93,6 +105,13 @@ struct Map
 			auto next_wp = get_waypoint(i + 1);
 			double nx = (wp.nx + next_wp.nx) / 2;
 			double ny = (wp.ny + next_wp.ny) / 2;
+			// the required lane distance is measured on the perpendicular at the straight part, not at the avgnormal, which is at an angle (alpha)
+			double angle_of_normal = atan2(wp.ny, wp.nx);
+			double angle_of_avgnormal = atan2(ny, nx);
+			double cos_alpha = cos(angle_of_avgnormal - angle_of_normal);
+			nx /= cos_alpha;
+			ny /= cos_alpha;
+
 			for (int r = 0; r < 3; r++)
 			{
 				double offset = get_lane_center_offset(r);
@@ -247,6 +266,17 @@ struct Map
 	}
 };
 
+double get_jmt_pos(vector<double> &jmt, double t)
+{
+	return jmt[0] + t * jmt[1] + t * t*jmt[2] + t * t*t*jmt[3] + t * t*t*t*jmt[4] + t * t*t*t*t*jmt[5];
+
+}
+
+double get_jmt_speed(vector<double> &jmt, double t)
+{
+	return jmt[1] + 2 * t*jmt[2] + 3 * t*t*jmt[3] + 4 * t*t*t*jmt[4] + 5 * t*t*t*t*jmt[5];
+}
+
 int main() {
   uWS::Hub h;
 
@@ -285,8 +315,13 @@ int main() {
   }
   Map map;
   map.Init(map_waypoints_x, map_waypoints_y);
+  double prev_car_speed = 0;
+  double prev_car_acc = 0;
+  bool prev_speed_valid = false;
+  bool prev_acc_valid = false;
+  std::map<int, Car> sensor_fusion_cars;
 
-  h.onMessage([&map]
+  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -307,10 +342,31 @@ int main() {
           // Main car's localization Data
           double ego_x = j[1]["x"];
           double ego_y = j[1]["y"];
-          double ego_s = j[1]["s"];
-          double ego_d = j[1]["d"];
+          double ego_s_orig = j[1]["s"];
+          double ego_d_orig = j[1]["d"];
           double ego_yaw = j[1]["yaw"];
-          double ego_speed = j[1]["speed"];
+          double ego_speed = j[1]["speed"] / 2.237;
+		  double ego_acc=0, ego_jerk=0;
+
+		  if (prev_speed_valid)
+		  {
+			  ego_acc = (ego_speed - prev_car_speed) * 50;
+			  if (prev_acc_valid)
+			  {
+				  ego_jerk = (ego_acc - prev_car_acc) * 50;
+			  }
+			  prev_car_acc = ego_acc;
+			  prev_acc_valid = true;
+		  }
+		  prev_car_speed = ego_speed;
+		  prev_speed_valid = true;
+
+		  printf("v % 4.2f acc % 4.2f jerk % 4.2f", ego_speed, ego_acc, ego_jerk);
+		  
+		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
+		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
+		  if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
+		  if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
 
 		  // Previous path data given to the Planner
           auto previous_path_x = j[1]["previous_path_x"];
@@ -324,27 +380,43 @@ int main() {
           auto sensor_fusion = j[1]["sensor_fusion"];
 
 		  map.init_reference_waypoint(ego_x, ego_y);
+		  int ego_lane;
+		  double ego_s, ego_d;
+		  if (!map.lane_matching(ego_x, ego_y, ego_s, ego_d, ego_lane))
+		  {
+			  printf("Warning! can't lane match ego\n");
+			  ego_s = ego_d = 0;
+			  ego_lane = 0;
+		  }
 
 		  for (int i = 0; i < (int)sensor_fusion.size(); i++)
 		  {
 			  auto car_data = sensor_fusion[i];
 			  int id = car_data[0];
-			  auto &car = SensorFusionCars[id];
+			  auto &car = sensor_fusion_cars[id];
 			  car.id = id;
 			  car.x = car_data[1];
 			  car.y= car_data[2];
 			  car.vx = car_data[3];
 			  car.vy = car_data[4];
-			  car.s = car_data[5];
-			  car.d = car_data[6];
+			  if (!map.lane_matching(car.x, car.y, car.s, car.d, car.lane))
+			  {
+				  printf("Warning! can't lane match car %d at %.2f %.2f\n", id, car.x, car.y);
+				  sensor_fusion_cars.erase(sensor_fusion_cars.find(id));
+			  }
+			  else
+			  {
+				  //car.s = car_data[5];
+				  //car.d = car_data[6];
+			  }
 		  }
 
 		  int next_car_id = -1;
 		  double next_s = 0;
-		  for (auto &p : SensorFusionCars)
+		  for (auto &p : sensor_fusion_cars)
 		  {
 			  auto &car = p.second;
-			  if (car.s > ego_s && fabs(car.d - ego_d) < 2)
+			  if (car.s > ego_s && fabs(car.d - ego_d) < 3.5)
 			  {
 				  if (next_car_id == -1 || next_s > car.s)
 				  {
@@ -353,29 +425,102 @@ int main() {
 				  }
 			  }
 		  }
-		  double car_length = 7;
-		  double safety_distance = 5;
+		  double car_length = 5;
+		  double safety_distance = 2;
 		  double max_speed = 44.4;//22.2;
 		  if (next_car_id != -1)
 		  {
-			  auto &car = SensorFusionCars[next_car_id];
-			  double s, d;
-			  int lane;
-			  map.lane_matching(car.x, car.y, s, d, lane);
+			  auto &car = sensor_fusion_cars[next_car_id];
 			  double cartesian_dist = distance(car.x, car.y, ego_x, ego_y);
-			  printf("next car telemetry (%.2f, %.2f) calculated (%.2f, %.2f) diff %.2f xy_dist: %.2f dist: %.2f in lane %d\n",
-				  car.s, car.d, s + ego_s, d, fabs(s + ego_s - car.s), s, cartesian_dist, lane);
-			  ego_s = 0;
-			  next_s = s;
+			  printf(" next car (%.2f, %.2f) s_dist: %.2f xy_dist: %.2f in lane %d",
+				  car.s, car.d, next_s, cartesian_dist, car.lane);
 		  }
-		  if (next_car_id != -1 && ego_s+car_length+safety_distance>next_s)
+		  vector<double> in_lane_jmt;
+		  double in_lane_jmt_max_time = 0;
+		  if (next_car_id != -1)
 		  {
-			  auto &car = SensorFusionCars[next_car_id];
-			  double t_to_reach_optimal_distance = 1; // sec
-			  double excess_distance = ego_s + car_length - next_s; // negative when approaching
-			  max_speed = std::min(max_speed, sqrt(car.vx*car.vx + car.vy*car.vy)) - excess_distance / t_to_reach_optimal_distance;
-		  }
+			  vector<double> start = { ego_s, ego_speed, ego_acc };
 
+			  auto &follow_car = sensor_fusion_cars[next_car_id];
+			  double follow_car_distance = next_s - ego_s - car_length;
+			  if (follow_car_distance < 0)
+			  {
+				  printf("detected collision");
+				  follow_car_distance = 0; // collision already
+			  }
+			  double follow_car_speed = sqrt(follow_car.vx*follow_car.vx + follow_car.vy*follow_car.vy);
+			  bool can_accelerate = true;
+			  // check emergency breaking, safe distance
+			  if (ego_speed > follow_car_speed)
+			  {
+				  double delta_v = ego_speed - follow_car_speed;
+				  double delta_t = delta_v / relaxed_acc;
+				  double delta_d = ego_speed * delta_t - delta_v / 2 * delta_t;
+				  double max_dist = follow_car_distance - safety_distance;
+				  if (delta_d > max_dist)
+				  {
+					  // need to start breaking. The most efficient way to maintain safety distance is to pretend that the car ahead breaks at maximum deceleration and stops
+					  double time_for_follow_car_to_stop = follow_car_speed / maximum_acc;
+					  double extra_distance_while_stopping = time_for_follow_car_to_stop * follow_car_speed / 2;
+					  double follow_car_predicted_pos = next_s + extra_distance_while_stopping;
+					  // we reach the car pos in delta_t, plus the time to stop
+					  vector<double> end = { follow_car_predicted_pos - car_length - safety_distance, 0, 0 };
+					  in_lane_jmt_max_time = time_for_follow_car_to_stop + delta_t;
+					  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
+					  can_accelerate = false;
+
+				  }
+			  }
+			  /*double speed_diff = fabs(follow_car_speed - ego_speed);
+			  if (ego_speed > follow_car_speed && can_accelerate)
+			  {
+				  double collision_time = follow_car_distance / (ego_speed - follow_car_speed);
+				  if (collision_time > 10)
+				  {
+					  // follow car is far, can accelerate
+				  }
+				  else
+				  {
+					  // need to break, follow mode
+					  double follow_car_predicted_pos = follow_car_speed * collision_time + next_s;
+					  vector<double> end = { follow_car_predicted_pos - car_length - safety_distance, follow_car_speed, 0 };
+					  in_lane_jmt_max_time = collision_time;
+					  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
+					  
+					  can_accelerate = false;
+				  }
+			  }
+			  double follow_sync_time = 3; // if speed is no problem, match distance if it's in 3 seconds range
+			  if (can_accelerate && follow_car_distance<ego_speed*follow_sync_time) 
+			  {
+				  double follow_car_predicted_pos = follow_car_speed * follow_sync_time + next_s;
+				  vector<double> end = { follow_car_predicted_pos - car_length - safety_distance, follow_car_speed, 0 };
+				  in_lane_jmt_max_time = follow_sync_time;
+				  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
+				  can_accelerate = false;
+			  }*/
+			  /*
+			  double t_to_reach_optimal_distance = 1; // sec
+			  double follow_car_predicted_pos = follow_car_speed * t_to_reach_optimal_distance + next_s;
+			  double ego_car_predicted_pos = ego_speed * t_to_reach_optimal_distance + ego_s;
+
+			  if (ego_s + car_length + safety_distance > next_s)
+			  {
+				  
+
+				  double excess_distance = ego_s + car_length - next_s; // negative when approaching
+				  
+				  
+				  max_speed = std::min(max_speed, follow_car_speed) - excess_distance / t_to_reach_optimal_distance;
+
+				  // should start from pos_x
+				  vector<double> start = { ego_s, ego_speed, ego_acc };
+				  vector<double> end = { follow_car_predicted_pos - car_length, follow_car_speed, 0 };
+				  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);
+			  }*/
+		  }
+		  if (in_lane_jmt.empty()) printf(" max speed %.2f\n", max_speed);
+		  else printf(" JMT start speed %.2f end speed %.2f (%.2fs)\n", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
 
           json msgJson;
 
@@ -404,6 +549,12 @@ int main() {
 			  pos_y = ego_y;
 			  angle = deg2rad(ego_yaw);
 		  }
+		  else if (path_size == 1)
+		  {
+			  pos_x = previous_path_x[path_size - 1];
+			  pos_y = previous_path_y[path_size - 1];
+			  angle = deg2rad(ego_yaw);
+		  }
 		  else {
 			  pos_x = previous_path_x[path_size - 1];
 			  pos_y = previous_path_y[path_size - 1];
@@ -415,7 +566,7 @@ int main() {
 		  trajectory.add_point(pos_x, pos_y);
 		  
 		  int nNextWaypoint = map.reference_waypoint_id;
-		  int ego_lane = 2;
+		  //ego_lane = 2;
 		  // skip next waypoint if it's between car pos and end of fixed trajectory head
 		  {
 			  double s, d;
@@ -432,15 +583,22 @@ int main() {
 		  }
 
 		  double dist_total = 0;
-		  double dist_step = max_speed/50;
+		  double current_t = 0.02;
+		  double speed = max_speed;
 		  for (int i = 1; i < trajectory.waypoints.size(); i++)
 		  {
 			  double x = trajectory.waypoints[i].x;
 			  double y = trajectory.waypoints[i].y;
 			  for (;;)
 			  {
+				  if (!in_lane_jmt.empty() && current_t <= in_lane_jmt_max_time)
+				  {
+					  speed = get_jmt_speed(in_lane_jmt, current_t);
+				  }
+				  double dist_step = speed / 50;
 				  double dist = distance(pos_x, pos_y, x, y);
 				  if (dist < dist_step) break;
+				  current_t += 0.02;
 				  pos_x += (x-pos_x)*dist_step / dist;
 				  pos_y += (y-pos_y)*dist_step / dist;
 				  next_x_vals.push_back(pos_x);
@@ -450,7 +608,8 @@ int main() {
 			  if (next_x_vals.size() >= 50) break;
 		  }
 
-		  FILE *fLog = fopen("trajectory.log", "wt");
+		  bool need_log = false;
+		  FILE *fLog = need_log?fopen("trajectory.log", "wt"):NULL;
 		  if (fLog != NULL)
 		  {
 			  double prev_heading = 0;
@@ -472,7 +631,6 @@ int main() {
 			  }
 			  fclose(fLog);
 		  }
-
 
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
