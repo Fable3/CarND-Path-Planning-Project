@@ -295,7 +295,15 @@ vector<double> JMT(vector<double> &start, vector<double> &end, double T) {
 	return result;
 }
 
+double get_jmt_pos(vector<double> &jmt, double t)
+{
+	return jmt[0] + t * jmt[1] + t * t*jmt[2] + t * t*t*jmt[3] + t * t*t*t*jmt[4] + t * t*t*t*t*jmt[5];
+}
 
+double get_jmt_speed(vector<double> &jmt, double t)
+{
+	return jmt[1] + 2 * t*jmt[2] + 3 * t*t*jmt[3] + 4 * t*t*t*jmt[4] + 5 * t*t*t*t*jmt[5];
+}
 
 
 #endif  // HELPERS_H
