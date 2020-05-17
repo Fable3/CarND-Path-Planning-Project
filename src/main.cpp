@@ -14,6 +14,7 @@
 #include "json.hpp"
 #include "spline.h"
 
+#include <conio.h>
 // for convenience
 using nlohmann::json;
 using std::string;
@@ -260,6 +261,55 @@ struct Map
 		}
 		return found_any;
 	}
+
+	Point get_lane_pos(double s, int lane)
+	{
+		double ratio = reference_waypoint_ratio[lane];
+		int wp_id = reference_waypoint_id;
+		Point next_pt, prev_pt;
+		double dest_ratio = 0; // result is between prev_pt and next_pt, at next_pt if 1.0
+
+		for (;;)
+		{
+			next_pt = get_waypoint(wp_id).lane_center[lane];
+			prev_pt = get_waypoint(wp_id - 1).lane_center[lane];
+			double wp_len = (next_pt - prev_pt).length();
+			if (s > 0)
+			{
+				double remaining_length = wp_len * (1 - ratio);
+				if (s <= remaining_length)
+				{
+					// if wp_len is 100m, ratio is 0.4, s is 50:
+					//    remaining_length = 60
+					//    dest_ratio = 1-(60-50)/100 or 0.4+50/60*0.6
+					dest_ratio = 1 - (remaining_length - s) / wp_len;
+					break;
+				}
+				s -= remaining_length;
+				ratio = 0;
+				wp_id++;
+			}
+			else
+			{
+				double remaining_length = wp_len * ratio;
+				if (-s <= remaining_length)
+				{
+					// if wp_len is 100m, ratio is 0.4, s is -30:
+					//    remaining_length = 40
+					//    dest_ratio = (40-30)/100 or (40-30)/40*0.4
+					dest_ratio = (remaining_length + s) / wp_len;					
+					break;
+				}
+				s += remaining_length;
+				ratio = 1;
+				wp_id--;
+			}
+		}
+		Point ret;
+		ret.x = next_pt.x*dest_ratio + prev_pt.x*(1 - dest_ratio);
+		ret.y = next_pt.y*dest_ratio + prev_pt.y*(1 - dest_ratio);
+		return ret;
+	}
 };
 
 
@@ -291,19 +341,19 @@ struct TrajectoryBuilder
 {
 	double total_dist = 0;
 	vector<Point > waypoints;
-	void add_waypoint(double x, double y)
+	void add_waypoint(Point p)
 	{
 		if (waypoints.size() > 0)
 		{
 			auto prev_p = waypoints.back();
-			total_dist += distance(prev_p.x, prev_p.y, x, y);
+			total_dist += distance(prev_p.x, prev_p.y, p.x, p.y);
 		}
-		waypoints.push_back(Point(x, y));
+		waypoints.push_back(p);
 	}
 	
 	vector<Point> build(vector<Point> &prev_trajectory,
 		double ego_x, double ego_y, double ego_yaw, // fallback for init if not enough points in prev_trajectory
-		int ego_lane,
+		int ego_lane, int target_lane,
 		Map &map,
 		SpeedController &speed_controller)
 	{
@@ -338,7 +388,7 @@ struct TrajectoryBuilder
 				angle = atan2(pos_y - pos_y2, pos_x - pos_x2);
 			}
 		}
-		add_waypoint(pos_x, pos_y); // startup
+		add_waypoint(Point(pos_x, pos_y)); // startup
 
 		int nNextWaypoint = map.reference_waypoint_id;
 		//ego_lane = 2;
@@ -350,11 +400,34 @@ struct TrajectoryBuilder
 		}
 		//if (map.reference_waypoint_ratio[ego_lane] > 0.9) nNextWaypoint++; // prevent flukes
 
+		/*
 		for (int i = 0; i < 50 - path_size; ++i) {
 			Point p = map.get_waypoint(nNextWaypoint).lane_center[ego_lane];
 			add_waypoint(p.x, p.y);
 			if (total_dist > 50 && i>2) break;
 			nNextWaypoint = (nNextWaypoint + 1) % map.waypoints.size();
+		}*/
+		double wp_min_dist = speed_controller.start_speed * 1.0; // every seconds
+		wp_min_dist = std::max(wp_min_dist, 5.0); // at least 5 m
+		if (ego_lane != target_lane)
+		{
+			double lane_switch_time = 2.0;
+			double min_lane_switch_dist = 5.0;
+			double speed = speed_controller.start_speed;
+			double dist = speed * lane_switch_time;
+			if (dist < min_lane_switch_dist) dist = min_lane_switch_dist;
+			add_waypoint(map.get_lane_pos(dist, target_lane));
+			for (int i = 1; i <= 5; i++)
+			{
+				add_waypoint(map.get_lane_pos(dist+i*wp_min_dist, target_lane));
+			}
+		}
+		else
+		{
+			for (int i = 1; i <= 5; i++)
+			{
+				add_waypoint(map.get_lane_pos(i*wp_min_dist, ego_lane));
+			}
 		}
 
 		// transform waypoints for spline
@@ -408,6 +481,10 @@ struct TrajectoryBuilder
 				wp_y.resize(i);
 				break;
 			}
+		}
+		if (wp_x.size() < 3)
+		{
+			return prev_trajectory;
 		}
 		
 		spline.set_points(wp_x, wp_y);
@@ -501,8 +578,9 @@ int main() {
   bool prev_speed_valid = false;
   bool prev_acc_valid = false;
   std::map<int, Car> sensor_fusion_cars;
+  int target_lane = 0;
 
-  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars]
+  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -679,7 +757,7 @@ int main() {
 		  double safety_distance = 2;
 		  double keep_distance = 5;
 		  double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
-		  double max_speed = 22.2; // 50 mph
+		  double max_speed = 10*22.2; // 50 mph
 		  if (next_car_id != -1)
 		  {
 			  auto &car = sensor_fusion_cars[next_car_id];
@@ -835,7 +913,14 @@ int main() {
 
 		  TrajectoryBuilder trajectory;
 		  
-		  vector<Point> refined_trajectory = trajectory.build(prev_trajectory, ego_x, ego_y, ego_yaw, ego_lane, map, speed_controller);
+		  if (_kbhit())
+		  {
+			  char ch = _getch();
+			  if (ch == 'A' || ch == 'a') target_lane = std::max(0, target_lane - 1);
+			  if (ch == 'D' || ch == 'd') target_lane = std::min(2, target_lane + 1);
+			  
+		  }
+		  vector<Point> refined_trajectory = trajectory.build(prev_trajectory, ego_x, ego_y, ego_yaw, ego_lane, target_lane, map, speed_controller);
 
 		  vector<double> next_x_vals(refined_trajectory.size());
 		  vector<double> next_y_vals(refined_trajectory.size());
