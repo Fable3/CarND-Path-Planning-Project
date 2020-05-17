@@ -4,5 +4,5 @@ src/Debug/
 src/Release/
 src/.vs/
 src/CarND-Path-Planning-Project.vcxproj.user
-src/trajectory.log
+src/trajectory.log*
 todo.txt

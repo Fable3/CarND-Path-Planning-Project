@@ -162,19 +162,19 @@ struct Point
 	double x, y;
 	Point() { x = y = 0; }
 	Point(double _x, double _y) :x(_x), y(_y) {}
-	Point operator-(Point B) {
+	Point operator-(const Point B) const {
 		return Point(x - B.x, y - B.y);
 	}
-	Point operator+(Point B) {
+	Point operator+(const Point B) const {
 		return Point(x + B.x, y + B.y);
 	}
-	double length() {
+	double length() const {
 		return sqrt(x * x + y * y);
 	}
-	double lengthsq() {
+	double lengthsq() const {
 		return x * x + y * y;
 	}
-	double dotp(Point B)
+	double dotp(Point B) const
 	{
 		return x * B.x + y * B.y;
 	}

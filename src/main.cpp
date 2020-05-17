@@ -24,6 +24,8 @@ using std::vector;
 
 #define EPSILON 1e-5
 
+FILE *fLog = NULL;
+
 void error_condition(const char *filename, int line, const char *text)
 {
 	std::cerr << "Assert failed in " << filename << " line " << line << ": " << text << std::endl;
@@ -34,8 +36,8 @@ void error_condition(const char *filename, int line, const char *text)
 double relaxed_jerk = 5; // m/s^3
 double relaxed_acc = 5; // m/s^2
 double min_relaxed_acc_while_braking = 4; // m/s^2
-double maximum_jerk = 10;
-double maximum_acc = 10;
+double maximum_jerk = 9;
+double maximum_acc = 9;
 
 struct Car
 {
@@ -262,7 +264,7 @@ struct Map
 		return found_any;
 	}
 
-	Point get_lane_pos(double s, int lane)
+	Point get_lane_pos(double s, int lane, int &next_waypoint_id, double &next_waypoint_distance)
 	{
 		double ratio = reference_waypoint_ratio[lane];
 		int wp_id = reference_waypoint_id;
@@ -283,6 +285,7 @@ struct Map
 					//    remaining_length = 60
 					//    dest_ratio = 1-(60-50)/100 or 0.4+50/60*0.6
 					dest_ratio = 1 - (remaining_length - s) / wp_len;
+					next_waypoint_distance = remaining_length - s;
 					break;
 				}
 				s -= remaining_length;
@@ -297,7 +300,9 @@ struct Map
 					// if wp_len is 100m, ratio is 0.4, s is -30:
 					//    remaining_length = 40
 					//    dest_ratio = (40-30)/100 or (40-30)/40*0.4
-					dest_ratio = (remaining_length + s) / wp_len;					
+					//    next_waypoint_distance = 100*(1-0.4)+30
+					dest_ratio = (remaining_length + s) / wp_len;
+					next_waypoint_distance = wp_len*(1-ratio) - s;
 					break;
 				}
 				s += remaining_length;
@@ -308,6 +313,7 @@ struct Map
 		Point ret;
 		ret.x = next_pt.x*dest_ratio + prev_pt.x*(1 - dest_ratio);
 		ret.y = next_pt.y*dest_ratio + prev_pt.y*(1 - dest_ratio);
+		next_waypoint_id = wp_id;
 		return ret;
 	}
 };
@@ -390,6 +396,7 @@ struct TrajectoryBuilder
 		}
 		add_waypoint(Point(pos_x, pos_y)); // startup
 
+		/*
 		int nNextWaypoint = map.reference_waypoint_id;
 		//ego_lane = 2;
 		// skip next waypoint if it's between car pos and end of fixed trajectory head
@@ -399,16 +406,16 @@ struct TrajectoryBuilder
 			map.lane_matching(pos_x, pos_y, s, d, lane, &nNextWaypoint, 1 << ego_lane);
 		}
 		//if (map.reference_waypoint_ratio[ego_lane] > 0.9) nNextWaypoint++; // prevent flukes
-
-		/*
+		
 		for (int i = 0; i < 50 - path_size; ++i) {
 			Point p = map.get_waypoint(nNextWaypoint).lane_center[ego_lane];
 			add_waypoint(p.x, p.y);
 			if (total_dist > 50 && i>2) break;
 			nNextWaypoint = (nNextWaypoint + 1) % map.waypoints.size();
 		}*/
-		double wp_min_dist = speed_controller.start_speed * 1.0; // every seconds
-		wp_min_dist = std::max(wp_min_dist, 5.0); // at least 5 m
+		double min_control_point_dist = speed_controller.start_speed * 1;
+		min_control_point_dist = std::max(min_control_point_dist, 5.0); // at least 5 m
+		double contol_point_start_s = 0;
 		if (ego_lane != target_lane)
 		{
 			double lane_switch_time = 2.0;
@@ -416,19 +423,57 @@ struct TrajectoryBuilder
 			double speed = speed_controller.start_speed;
 			double dist = speed * lane_switch_time;
 			if (dist < min_lane_switch_dist) dist = min_lane_switch_dist;
-			add_waypoint(map.get_lane_pos(dist, target_lane));
-			for (int i = 1; i <= 5; i++)
-			{
-				add_waypoint(map.get_lane_pos(dist+i*wp_min_dist, target_lane));
-			}
+			double waypoint_dist;
+			int next_wp;
+			add_waypoint(map.get_lane_pos(dist, target_lane, next_wp, waypoint_dist));
+			contol_point_start_s = dist;
 		}
-		else
+		/*else
 		{
-			for (int i = 1; i <= 5; i++)
+			// check if next waypoint is close, keep it as a waypoint
+			double waypoint_dist;
+			int next_wp;
+			map.get_lane_pos(contol_point_start_s, target_lane, next_wp, waypoint_dist);
+			if (waypoint_dist < min_control_point_dist && waypoint_dist>5)
 			{
-				add_waypoint(map.get_lane_pos(i*wp_min_dist, ego_lane));
+				contol_point_start_s += waypoint_dist - min_control_point_dist;
 			}
+		}*/
+		for (int i = 0; i < 5; i++)
+		{
+			double waypoint_dist;
+			int next_wp;
+			contol_point_start_s += min_control_point_dist;
+			Point next_pt = map.get_lane_pos(contol_point_start_s, target_lane, next_wp, waypoint_dist);
+			/*if (waypoint_dist < min_control_point_dist)
+			{
+				// if the next waypoint is closer than double min_control_point_dist, we skip the next control point,
+				// and add the waypoint instead to avoid cutting corners, or adding too dense control points which would make it jerk
+				double tmp_dist;
+				int tmp_wp;
+				//next_pt = map.get_lane_pos(contol_point_start_s- min_control_point_dist/2+waypoint_dist/2, target_lane, tmp_wp, tmp_dist);
+				//add_waypoint(next_pt);
+				add_waypoint(map.get_waypoint(next_wp).lane_center[target_lane]);
+				contol_point_start_s += waypoint_dist;
+			}
+			else*/
+			{
+				add_waypoint(next_pt);
+			}
+			if (total_dist > 50 && waypoints.size() > 2) break;
 		}
+
+		if (fLog)
+		{
+			fprintf(fLog, "first control dist %.2f\n", (Point(pos_x, pos_y) - waypoints[1]).length());
+			fprintf(fLog, "prev_trajectory=[");
+			for (int i = 0; i < prev_trajectory.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", prev_trajectory[i].x, prev_trajectory[i].y);
+			fprintf(fLog, "]\n");
+			fprintf(fLog, "control_points=[");
+			for (int i = 0; i < waypoints.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", waypoints[i].x, waypoints[i].y);
+			fprintf(fLog, "]\n");
+		}
+
 
 		// transform waypoints for spline
 		double cos_angle = cos(-angle);
@@ -443,29 +488,25 @@ struct TrajectoryBuilder
 			p.x = tx;
 			p.y = ty;
 		}
-		for (int i = 0; i < (int)prev_trajectory.size(); i++)
+		vector<double> wp_x, wp_y;
+		for (int i = 0; i < int(prev_trajectory.size()) - 1; i++)
 		{
 			Point &p = prev_trajectory[i];
-			p = p - transform_center;
-			double tx = p.x*cos_angle - p.y*sin_angle;
-			double ty = p.x*sin_angle + p.y*cos_angle;
-			p.x = tx;
-			p.y = ty;
+			Point t = p - transform_center;
+			double tx = t.x*cos_angle - t.y*sin_angle;
+			double ty = t.x*sin_angle + t.y*cos_angle;
+
+			wp_x.push_back(tx);
+			wp_y.push_back(ty);
 		}
+
 		pos_x = 0;
 		pos_y = 0;
 		cos_angle = cos(angle);
 		sin_angle = sin(angle);
 
 		tk::spline spline;
-		vector<double> wp_x, wp_y;
-		for (int i = 0; i < int(prev_trajectory.size())-1; i++)
-		{
-			Point &p = prev_trajectory[i];
-			wp_x.push_back(p.x);
-			wp_y.push_back(p.y);
-		}
-
+		
 		for (int i = 0; i < (int)waypoints.size(); i++)
 		{
 			wp_x.push_back(waypoints[i].x);
@@ -477,6 +518,7 @@ struct TrajectoryBuilder
 			if (wp_x[i] < wp_x[i - 1])
 			{
 				printf("\nspline input error\n");
+				if (fLog) fprintf(fLog, "spline input error at idx %d x values %.4f<%.4f\n", i, wp_x[i], wp_x[i - 1]);
 				wp_x.resize(i);
 				wp_y.resize(i);
 				break;
@@ -508,9 +550,10 @@ struct TrajectoryBuilder
 			double x = current_sp_arg + dist_step;
 			double y = sp_result;
 			double dist = distance(pos_x, pos_y, x, y);
-			if (dist < dist_step)
+			if (dist+EPSILON < dist_step)
 			{
-				printf("\nspline error, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
+				printf("\nspline warning, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
+				if (fLog) fprintf(fLog, "spline warning, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
 			}
 			if (current_t == 0.02) printf(" next sp %.2f", speed);
 			current_t += 0.02;
@@ -525,6 +568,12 @@ struct TrajectoryBuilder
 			tp = tp + transform_center;				
 			result_points.push_back(tp);
 			if (result_points.size() >= 50) break;
+		}
+		if (fLog)
+		{
+			fprintf(fLog, "result=[");
+			for (int i = 0; i < result_points.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i==0?"":",", result_points[i].x, result_points[i].y);
+			fprintf(fLog, "]\n");
 		}
 		return result_points;
 	}
@@ -578,7 +627,16 @@ int main() {
   bool prev_speed_valid = false;
   bool prev_acc_valid = false;
   std::map<int, Car> sensor_fusion_cars;
-  int target_lane = 0;
+  int target_lane = 1;
+
+  bool need_log = true;
+  if (need_log)
+  {
+	  fLog = fopen("trajectory.log", "wt");
+	  fprintf(fLog, "wpmap=[");
+	  for (int i = 0; i < map_waypoints_x.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", map_waypoints_x[i], map_waypoints_y[i]);
+	  fprintf(fLog, "]\n");
+  }
 
   h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
@@ -664,17 +722,8 @@ int main() {
 			  }
 		  }
 
-		  printf("v % 4.2f acc % 4.2f jerk % 4.2f", ego_speed, ego_acc, ego_jerk);
-
-		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
-		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
-		  if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
-		  if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
-
-		  
-
-
-          // Sensor Fusion Data, a list of all other cars on the same side 
+		  //printf("v % 4.2f acc % 4.2f jerk % 4.2f", ego_speed, ego_acc, ego_jerk);
+		  // Sensor Fusion Data, a list of all other cars on the same side 
           //   of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
 
@@ -687,6 +736,14 @@ int main() {
 			  ego_s = ego_d = 0;
 			  ego_lane = 0;
 		  }
+		  printf("v% 4.2f a% 4.2f d% 4.2f", ego_speed, ego_acc, ego_d);
+		  if (fLog) fprintf(fLog, "v%.2f a%.2f d%.2f\n", ego_speed, ego_acc, ego_d);
+
+		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
+		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
+		  if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
+		  if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
+
 
 		  for (int i = 0; i < (int)sensor_fusion.size(); i++)
 		  {
@@ -757,15 +814,15 @@ int main() {
 		  double safety_distance = 2;
 		  double keep_distance = 5;
 		  double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
-		  double max_speed = 10*22.2; // 50 mph
+		  double max_speed = 22.2; // 50 mph
 		  if (next_car_id != -1)
 		  {
 			  auto &car = sensor_fusion_cars[next_car_id];
-			  printf(" next car (%.2f, %.2f) v (%.2f, %.2f) s_dist: %.2f in lane %d",
+			  printf(" next (%.2f, %.2f) v (%.2f, %.2f) s_dist: %.2f lane %d",
 				  car.s, car.d, car.vs, car.vd, next_s-ego_s, car.lane);
 		  }
-		  vector<double> in_lane_jmt;
-		  double in_lane_jmt_max_time = 0;
+		  //vector<double> in_lane_jmt;
+		  //double in_lane_jmt_max_time = 0;
 		  SpeedController speed_controller;
 		  speed_controller.start_speed = ego_speed;
 		  speed_controller.target_speed = max_speed;
@@ -906,8 +963,9 @@ int main() {
 				  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);
 			  }*/
 		  }
-		  if (in_lane_jmt.empty()) printf(" target speed %.2f in %.2f", speed_controller.target_speed, speed_controller.target_time);
-		  else printf(" JMT start speed %.2f end speed %.2f (%.2fs)", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
+		  printf(" target %.2f @ %.2f", speed_controller.target_speed, speed_controller.target_time);
+		  //if (in_lane_jmt.empty()) 
+		  //else printf(" JMT start speed %.2f end speed %.2f (%.2fs)", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
 
           json msgJson;
 
@@ -931,9 +989,7 @@ int main() {
 			  next_y_vals[i] = refined_trajectory[i].y;
 		  }
 
-		  bool need_log = false;
-		  FILE *fLog = need_log?fopen("trajectory.log", "wt"):NULL;
-		  if (fLog != NULL)
+		  /*if (fLog != NULL)
 		  {
 			  double prev_heading = 0;
 			  for (int i = 0; i < (int)next_x_vals.size(); i++)
@@ -953,7 +1009,8 @@ int main() {
 				  prev_heading = heading;
 			  }
 			  fclose(fLog);
-		  }
+		  }*/
+		  if (fLog) fflush(fLog);
 		  printf("\n");
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
