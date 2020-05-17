@@ -174,6 +174,10 @@ struct Point
 	double lengthsq() {
 		return x * x + y * y;
 	}
+	double dotp(Point B)
+	{
+		return x * B.x + y * B.y;
+	}
 };
 
 double distancesq_pt_pt(Point p, Point A)

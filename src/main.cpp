@@ -21,6 +21,8 @@ using std::vector;
 
 #define NUM_LANES 3
 
+#define EPSILON 1e-5
+
 void error_condition(const char *filename, int line, const char *text)
 {
 	std::cerr << "Assert failed in " << filename << " line " << line << ": " << text << std::endl;
@@ -44,6 +46,15 @@ struct Car
 	double acc_x, acc_y;
 	double vs, vd;
 	int lane;
+
+	double predicted_s(double delta_t)
+	{
+		return s + vs * delta_t;
+	}
+	double predicted_d(double delta_t)
+	{
+		return d + vd * delta_t;
+	}
 };
 
 
@@ -277,6 +288,9 @@ double get_jmt_speed(vector<double> &jmt, double t)
 	return jmt[1] + 2 * t*jmt[2] + 3 * t*t*jmt[3] + 4 * t*t*t*jmt[4] + 5 * t*t*t*t*jmt[5];
 }
 
+//int jump_to_waypoint = 30; // traffic block
+int jump_to_waypoint = 0;
+
 int main() {
   uWS::Hub h;
 
@@ -362,18 +376,55 @@ int main() {
 		  prev_speed_valid = true;
 
 		  printf("v % 4.2f acc % 4.2f jerk % 4.2f", ego_speed, ego_acc, ego_jerk);
+		  // doesn't work from car speed, end of prev path would be better
+		  ego_acc = 0;
+		  ego_jerk = 0;
 		  
-		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
-		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
-		  if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
-		  if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
-
 		  // Previous path data given to the Planner
           auto previous_path_x = j[1]["previous_path_x"];
           auto previous_path_y = j[1]["previous_path_y"];
           // Previous path's end s and d values 
           double end_path_s = j[1]["end_path_s"];
           double end_path_d = j[1]["end_path_d"];
+
+		  vector<Point> prev_trajectory;
+		  double delta_t0 = 0; // time in the future where trajectory planning starts, at the end of kept previous path
+
+		  int prev_trajectory_length = 4; // need 1 for pos, 2 for speed, 3 for acc, 4 for jerk
+		  if (previous_path_x.size() >= prev_trajectory_length)
+		  {
+			  for (int i = 0; i < prev_trajectory_length; i++)
+			  {
+				  Point p(previous_path_x[i], previous_path_y[i]);
+				  prev_trajectory.push_back(p);
+			  }
+			  double v1 = (prev_trajectory[1] - prev_trajectory[0]).length();
+			  double v2 = (prev_trajectory[2] - prev_trajectory[1]).length();
+			  double v3 = (prev_trajectory[3] - prev_trajectory[2]).length();
+			  ego_acc = (v3 - v2) * 50;
+			  double prev_acc = (v2 - v1) * 50;
+			  ego_jerk = (ego_acc - prev_acc) * 50;
+			  ego_speed = v3 * 50;
+			  ego_x = prev_trajectory[3].x;
+			  ego_y = prev_trajectory[3].y;
+			  delta_t0 = prev_trajectory_length / 50.0;
+		  }
+		  else
+		  {
+			  if (jump_to_waypoint)
+			  {
+				  Point p = map.get_waypoint(jump_to_waypoint).lane_center[1];
+				  ego_x = p.x;
+				  ego_y = p.y;
+				  //jump_to_waypoint = 0;
+			  }
+		  }
+
+		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
+		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
+		  if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
+		  if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
+
 
           // Sensor Fusion Data, a list of all other cars on the same side 
           //   of the road.
@@ -399,7 +450,8 @@ int main() {
 			  car.y= car_data[2];
 			  car.vx = car_data[3];
 			  car.vy = car_data[4];
-			  if (!map.lane_matching(car.x, car.y, car.s, car.d, car.lane))
+			  int next_wp_id = 0;
+			  if (!map.lane_matching(car.x, car.y, car.s, car.d, car.lane, &next_wp_id))
 			  {
 				  printf("Warning! can't lane match car %d at %.2f %.2f\n", id, car.x, car.y);
 				  sensor_fusion_cars.erase(sensor_fusion_cars.find(id));
@@ -408,6 +460,32 @@ int main() {
 			  {
 				  //car.s = car_data[5];
 				  //car.d = car_data[6];
+				  double rnom, snom, rdenom;
+				  Point wp_vector = map.get_waypoint(next_wp_id).ref - map.get_waypoint(next_wp_id-1).ref;
+				  Point speed_vector = Point(car.vx, car.vy);
+				  double speed_vector_len = speed_vector.length();
+				  if (speed_vector_len < EPSILON)
+				  {
+					  car.vs = speed_vector_len;
+					  car.vd = 0;
+				  }
+				  else
+				  {
+					  double wp_vector_len = wp_vector.length();
+					  wp_vector.x *= speed_vector_len / wp_vector_len;
+					  wp_vector.y *= speed_vector_len / wp_vector_len;
+					  double speed_sign = 1.0;
+
+					  if (wp_vector.dotp(speed_vector) < 0)
+					  {
+						  speed_vector.x *= -1;
+						  speed_vector.y *= -1;
+						  speed_sign = -1;
+					  }
+					  distancesq_pt_seg(Point(car.vx, car.vy), Point(0, 0), wp_vector, rnom, rdenom, snom);
+					  car.vs = (rnom / rdenom)*speed_vector_len * speed_sign;
+					  car.vd = (snom / rdenom)*speed_vector_len * speed_sign;
+				  }
 			  }
 		  }
 
@@ -415,30 +493,40 @@ int main() {
 		  double next_s = 0;
 		  for (auto &p : sensor_fusion_cars)
 		  {
-			  auto &car = p.second;
-			  if (car.s > ego_s && fabs(car.d - ego_d) < 3.5)
+			  auto &other = p.second;
+			  double s0 = other.predicted_s(delta_t0);
+			  double d0 = other.predicted_d(delta_t0);
+			  if (s0 > ego_s && fabs(d0 - ego_d) < 3.5)
 			  {
-				  if (next_car_id == -1 || next_s > car.s)
+				  if (next_car_id == -1 || next_s > s0)
 				  {
-					  next_car_id = car.id;
-					  next_s = car.s;
+					  next_car_id = other.id;
+					  next_s = s0;
 				  }
 			  }
 		  }
-		  double car_length = 5;
+		  double car_length = 4.5;
 		  double safety_distance = 2;
+		  double safety_distance_leeway = 0.5; // when following, match car in front speed if in this range
 		  double max_speed = 44.4;//22.2;
 		  if (next_car_id != -1)
 		  {
 			  auto &car = sensor_fusion_cars[next_car_id];
 			  double cartesian_dist = distance(car.x, car.y, ego_x, ego_y);
-			  printf(" next car (%.2f, %.2f) s_dist: %.2f xy_dist: %.2f in lane %d",
-				  car.s, car.d, next_s, cartesian_dist, car.lane);
+			  printf(" next car (%.2f, %.2f) v (%.2f, %.2f) s_dist: %.2f xy_dist: %.2f in lane %d",
+				  car.s, car.d, car.vs, car.vd, next_s-ego_s, cartesian_dist, car.lane);
 		  }
 		  vector<double> in_lane_jmt;
 		  double in_lane_jmt_max_time = 0;
+		  double target_speed = max_speed;
+		  double delta_to_max_speed = fabs(ego_speed - max_speed);
+		  double target_speed_time = delta_to_max_speed / relaxed_acc;
 		  if (next_car_id != -1)
 		  {
+			  if (next_s - ego_s < 6)
+			  {
+				  int alma = 0;
+			  }
 			  vector<double> start = { ego_s, ego_speed, ego_acc };
 
 			  auto &follow_car = sensor_fusion_cars[next_car_id];
@@ -457,7 +545,7 @@ int main() {
 				  double delta_t = delta_v / relaxed_acc;
 				  double delta_d = ego_speed * delta_t - delta_v / 2 * delta_t;
 				  double max_dist = follow_car_distance - safety_distance;
-				  if (delta_d > max_dist)
+				  /*if (delta_d > max_dist)
 				  {
 					  // need to start breaking. The most efficient way to maintain safety distance is to pretend that the car ahead breaks at maximum deceleration and stops
 					  double time_for_follow_car_to_stop = follow_car_speed / maximum_acc;
@@ -469,6 +557,51 @@ int main() {
 					  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
 					  can_accelerate = false;
 
+				  }*/
+				  if (delta_d > max_dist)
+				  {
+					  target_speed = follow_car_speed;
+					  // we have max_dist to decelerate, so from max_dist = (ego_speed - delta_v / 2)*target_speed_time:
+					  target_speed_time = max_dist / (ego_speed - delta_v / 2);
+					  // if max accel is reached, use up the safety distance:
+					  if (target_speed_time < EPSILON || delta_v / target_speed_time>maximum_acc)
+					  {
+						  printf(" MAXBRAKE");
+						  target_speed_time = delta_v / maximum_acc;
+					  }
+					  else
+					  {
+						  printf(" BRAKE");
+					  }
+					  can_accelerate = false;
+				  }
+			  }
+			  if (can_accelerate) // maintain safe distance
+			  {
+				  double t_to_reach_optimal_distance = 1; // sec
+				  double follow_car_predicted_pos = follow_car_speed * t_to_reach_optimal_distance + next_s;
+				  double ego_car_predicted_pos = ego_speed * t_to_reach_optimal_distance + ego_s;
+
+				  if (ego_s + car_length + safety_distance > next_s)
+				  {
+					  double excess_distance = ego_s + car_length + safety_distance - next_s; // negative when approaching
+
+					  target_speed = follow_car_speed - excess_distance / t_to_reach_optimal_distance;
+					  target_speed_time = t_to_reach_optimal_distance;
+					  can_accelerate = false;
+					  printf(" ADJUST");
+
+					  /*
+					  vector<double> start = { ego_s, ego_speed, ego_acc };
+					  vector<double> end = { follow_car_predicted_pos - car_length, follow_car_speed, 0 };
+					  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);*/
+				  }
+				  else if (ego_s + car_length + safety_distance + safety_distance_leeway > next_s)
+				  {
+					  // we maintain current speed, don't try to exacly maintain safety distance
+					  target_speed = ego_speed;
+					  target_speed_time = 0;
+					  printf(" KEEP");
 				  }
 			  }
 			  /*double speed_diff = fabs(follow_car_speed - ego_speed);
@@ -519,8 +652,8 @@ int main() {
 				  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);
 			  }*/
 		  }
-		  if (in_lane_jmt.empty()) printf(" max speed %.2f\n", max_speed);
-		  else printf(" JMT start speed %.2f end speed %.2f (%.2fs)\n", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
+		  if (in_lane_jmt.empty()) printf(" target speed %.2f in %.2f", target_speed, target_speed_time);
+		  else printf(" JMT start speed %.2f end speed %.2f (%.2fs)", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
 
           json msgJson;
 
@@ -536,7 +669,7 @@ int main() {
 		  double pos_x;
 		  double pos_y;
 		  double angle;
-		  int path_size = std::min(3, (int)previous_path_x.size());
+		  int path_size = std::min(prev_trajectory_length, (int)previous_path_x.size());
 
 		  for (int i = 0; i < path_size; ++i) {
 			  next_x_vals.push_back(previous_path_x[i]);
@@ -584,17 +717,24 @@ int main() {
 
 		  double dist_total = 0;
 		  double current_t = 0.02;
-		  double speed = max_speed;
+		  //double speed = max_speed;
+		  double start_speed = ego_speed;
 		  for (int i = 1; i < trajectory.waypoints.size(); i++)
 		  {
 			  double x = trajectory.waypoints[i].x;
 			  double y = trajectory.waypoints[i].y;
 			  for (;;)
 			  {
-				  if (!in_lane_jmt.empty() && current_t <= in_lane_jmt_max_time)
+				  /*if (!in_lane_jmt.empty() && current_t <= in_lane_jmt_max_time)
 				  {
 					  speed = get_jmt_speed(in_lane_jmt, current_t);
-				  }
+				  }*/
+				  // do linear speed, the only important point is the first one, we'll drop the rest in the next cycle,
+				  // so can't do smooth stuff
+				  double speed;
+				  if (current_t > target_speed_time) speed = target_speed;
+				  else speed = start_speed + (target_speed - start_speed)*current_t / target_speed_time;
+				  if (current_t == 0.02) printf("next sp %.2f", speed);
 				  double dist_step = speed / 50;
 				  double dist = distance(pos_x, pos_y, x, y);
 				  if (dist < dist_step) break;
@@ -631,7 +771,7 @@ int main() {
 			  }
 			  fclose(fLog);
 		  }
-
+		  printf("\n");
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
