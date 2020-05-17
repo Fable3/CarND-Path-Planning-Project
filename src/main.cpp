@@ -353,36 +353,100 @@ struct TrajectoryBuilder
 		for (int i = 0; i < 50 - path_size; ++i) {
 			Point p = map.get_waypoint(nNextWaypoint).lane_center[ego_lane];
 			add_waypoint(p.x, p.y);
-			if (total_dist > 50) break;
+			if (total_dist > 50 && i>2) break;
 			nNextWaypoint = (nNextWaypoint + 1) % map.waypoints.size();
 		}
+
+		// transform waypoints for spline
+		double cos_angle = cos(-angle);
+		double sin_angle = sin(-angle);
+		Point transform_center(pos_x, pos_y);
+		for (int i = 0; i < (int)waypoints.size(); i++)
+		{
+			Point &p = waypoints[i];
+			p = p - transform_center;
+			double tx = p.x*cos_angle - p.y*sin_angle;
+			double ty = p.x*sin_angle + p.y*cos_angle;
+			p.x = tx;
+			p.y = ty;
+		}
+		for (int i = 0; i < (int)prev_trajectory.size(); i++)
+		{
+			Point &p = prev_trajectory[i];
+			p = p - transform_center;
+			double tx = p.x*cos_angle - p.y*sin_angle;
+			double ty = p.x*sin_angle + p.y*cos_angle;
+			p.x = tx;
+			p.y = ty;
+		}
+		pos_x = 0;
+		pos_y = 0;
+		cos_angle = cos(angle);
+		sin_angle = sin(angle);
+
+		tk::spline spline;
+		vector<double> wp_x, wp_y;
+		for (int i = 0; i < int(prev_trajectory.size())-1; i++)
+		{
+			Point &p = prev_trajectory[i];
+			wp_x.push_back(p.x);
+			wp_y.push_back(p.y);
+		}
+
+		for (int i = 0; i < (int)waypoints.size(); i++)
+		{
+			wp_x.push_back(waypoints[i].x);
+			wp_y.push_back(waypoints[i].y);
+		}
+
+		for (int i = 1; i < (int)wp_x.size(); i++)
+		{
+			if (wp_x[i] < wp_x[i - 1])
+			{
+				printf("\nspline input error\n");
+				wp_x.resize(i);
+				wp_y.resize(i);
+				break;
+			}
+		}
+		
+		spline.set_points(wp_x, wp_y);
 
 		double dist_total = 0;
 		double current_t = 0.02;
 		//double speed = max_speed;
-		for (int i = 1; i < (int)waypoints.size(); i++)
+		//for (int i = 1; i < (int)waypoints.size(); i++)
+		double current_sp_arg = 0;
+		while (current_sp_arg<50) // 50 meters max, will stop at 50 points anyway
 		{
-			double x = waypoints[i].x;
-			double y = waypoints[i].y;
-			for (;;)
+			/*if (!in_lane_jmt.empty() && current_t <= in_lane_jmt_max_time)
 			{
-				/*if (!in_lane_jmt.empty() && current_t <= in_lane_jmt_max_time)
-				{
-					speed = get_jmt_speed(in_lane_jmt, current_t);
-				}*/
-				// do linear speed, the only important point is the first one, we'll drop the rest in the next cycle,
-				// so can't do smooth stuff
-				double speed = speed_controller.get_speed(current_t);
-				double dist_step = speed / 50;
-				double dist = distance(pos_x, pos_y, x, y);
-				if (dist < dist_step) break;
-				if (current_t == 0.02) printf(" next sp %.2f", speed);
-				current_t += 0.02;
-				pos_x += (x - pos_x)*dist_step / dist;
-				pos_y += (y - pos_y)*dist_step / dist;
-				result_points.push_back(Point(pos_x, pos_y));
-				if (result_points.size() >= 50) break;
+				speed = get_jmt_speed(in_lane_jmt, current_t);
+			}*/
+			// do linear speed, the only important point is the first one, we'll drop the rest in the next cycle,
+			// so can't do smooth stuff
+			double speed = speed_controller.get_speed(current_t);
+			double dist_step = speed / 50;
+			double sp_result = spline(current_sp_arg + dist_step);
+			double x = current_sp_arg + dist_step;
+			double y = sp_result;
+			double dist = distance(pos_x, pos_y, x, y);
+			if (dist < dist_step)
+			{
+				printf("\nspline error, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
 			}
+			if (current_t == 0.02) printf(" next sp %.2f", speed);
+			current_t += 0.02;
+			double sp_step = (x - pos_x)*dist_step / dist;
+			current_sp_arg += sp_step;
+			pos_x += sp_step;
+			pos_y += (y - pos_y)*dist_step / dist;
+			// transform back:
+			Point tp;
+			tp.x = pos_x * cos_angle - pos_y * sin_angle;
+			tp.y = pos_x * sin_angle + pos_y * cos_angle;
+			tp = tp + transform_center;				
+			result_points.push_back(tp);
 			if (result_points.size() >= 50) break;
 		}
 		return result_points;
@@ -602,7 +666,7 @@ int main() {
 			  auto &other = p.second;
 			  double s0 = other.predicted_s(delta_t0);
 			  double d0 = other.predicted_d(delta_t0);
-			  if (s0 > ego_s && fabs(d0 - ego_d) < 3.5)
+			  if (s0 > ego_s && fabs(d0 - ego_d) < 3)
 			  {
 				  if (next_car_id == -1 || next_s > s0)
 				  {
@@ -615,7 +679,7 @@ int main() {
 		  double safety_distance = 2;
 		  double keep_distance = 5;
 		  double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
-		  double max_speed = 44.4;//22.2;
+		  double max_speed = 22.2; // 50 mph
 		  if (next_car_id != -1)
 		  {
 			  auto &car = sensor_fusion_cars[next_car_id];
