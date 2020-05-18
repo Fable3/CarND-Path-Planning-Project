@@ -24,8 +24,8 @@ using std::vector;
 #define EPSILON 1e-5
 
 FILE *fLog = NULL;
-bool need_log = true;
-bool console_log = true;
+bool need_log = false;
+bool console_log = false;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -34,7 +34,6 @@ void error_condition(const char *filename, int line, const char *text)
 #undef assert
 #define assert(a) if(!(a)) error_condition (__FILE__, __LINE__, #a)
 
-double relaxed_jerk = 5; // m/s^3
 double relaxed_acc = 5; // m/s^2
 double min_relaxed_acc_while_braking = 4; // m/s^2
 double maximum_jerk = 9;
