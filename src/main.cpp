@@ -1073,7 +1073,8 @@ int main() {
           double ego_s_orig = j[1]["s"];
           double ego_d_orig = j[1]["d"];
           double ego_yaw = j[1]["yaw"];
-          double ego_speed = j[1]["speed"] / 2.237;
+          double ego_speed = j[1]["speed"];
+		  ego_speed /= 2.237;
 		  double ego_acc=0, ego_jerk=0;
 
 		  if (prev_speed_valid)
