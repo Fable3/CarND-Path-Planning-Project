@@ -1039,6 +1039,12 @@ int main() {
 	  fprintf(fLog, "wpmap=[");
 	  for (int i = 0; i < map_waypoints_x.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", map_waypoints_x[i], map_waypoints_y[i]);
 	  fprintf(fLog, "]\n");
+	  for (int lane = 0; lane < 3; lane++)
+	  {
+		  fprintf(fLog, "lane%d=[", lane);
+		  for (int i = 0; i < map.waypoints.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", map.waypoints[i].lane_center[lane].x, map.waypoints[i].lane_center[lane].y);
+		  fprintf(fLog, "]\n");
+	  }
   }
 
   int frame_count = 0;

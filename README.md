@@ -9,14 +9,14 @@ Here's a short gif about a random lane change.
 
 ![lane change](passing_sample.gif)
 
-I've measured the distance over 30 minutes to see the performance of the algorithm. With conservative paramters, only changing lane is there was a significant advantage, the [result](30min.png) was 20.71 miles.
+I've measured the distance over 30 minutes to see the performance of the algorithm. With conservative paramters (only changing lane when there was a significant advantage), the [result](30min.png) was 20.71 miles.
 After tweaking with lane score weights, the 30 minutes performance improved to 24.52 miles:
 
 ![30min_improved.png](30min_improved.png)
 
 ### Overview
 
-The trajectory is recalculated in every frame. Only a few points is kept from the previous trajectory to maintain continuity.
+The trajectory is recalculated in every frame. A few points is kept from the previous trajectory to maintain continuity, the rest is discarded.
 While this causes a lot of trouble with Spline or JMT, the ego vehicle has a much better response time, and it's more realistic.
 The safety and following distances are very low to showcase this behavior.
 
@@ -24,12 +24,12 @@ The Frenet transformation is not linar. When the road curves left, cars in the r
 The default implementation overcomes this issue by jumping through the gap, so the "s" function is not continuous.
 I've implemented a different approach, where the Frenet coordinate system is centered on the ego vehicle, and the "s" coordinate is continuous, but it's not precise for far objects.
 
-For trajectory generation, I use the spline library. Only 3 points is used from the previous trajectory, expanded backwards lineraly for 3 meters to make it smoother. Forward direction I add points which are on the target lane centerline.
+For trajectory generation, I use the spline library. Only 3 points are used from the previous trajectory, expanded backwards lineraly for 3 meters to make it smoother. Forward direction I add points which are on the target lane centerline.
 
 The speed is controlled by surrounding cars of the environmental model, referenced as "sensor fusion". The trajectory planner receives a target speed and a time to reach that speed.
 
 Lane change is determined by a scoring function, it's based on closest car distance, lane distance, and speed of traffic.
-Some lanes may blocked by cars, even fast approaching ones or slow cars ahead.
+Some lanes may be blocked by cars, even fast approaching ones or slow cars ahead.
 
 ### Trajectory Calculation Steps
 
@@ -44,7 +44,7 @@ Speed vector is projected to the waypoint segment with `map.project_speed` to ge
 `LaneChangePlanner` calculates a single `target_lane`, which is always adjacent to the current lane.
 
 Next, I check for the closest car ahead, and also the closest car in the target lane.
-This is usually the same car, because even if we just started the lane change, the car in the target lane would overlap in `d` axis with the ego vehicle, but it's important when changing lane to follow a slower car.
+This is usually the same car, because even during lane change, the car in the target lane would overlap in `d` axis with the ego vehicle, but it's important when starting lane change to follow a slower car.
 
 The `delta_t0` here is the timestamp of the end of our used previous trajectory, so the trajectory calculation starts at this timestamp in the near future.
 Except for startup, it's 0.08, which is also the minimum reaction time of the system.
@@ -104,6 +104,9 @@ The normal vector, which is unit length and perpendicular to the waypoint segmen
 The lane centerlines are generated so that the distance from the reference line is constant.
 The endpoints are calculated from the average of the normal vectors, which are extended by dividing it with cos(angle to perpendicular).
 This ensures that the lane distance is maintained on the parallel part.
+Here's an example of a trajectory near a waypoint, lane centerlines are yellow, reference line is green:
+
+![sample trajectory](sample_trajectory.png)
 
 `get_waypoint` takes care of cyclic indexing, so the callers can safely increment waypoint id without checking.
 
@@ -144,10 +147,10 @@ A simple class to handle constant acceleration. `get_speed` returns the speed as
 #### TrajectoryBuilder
 
 The trajectory is normally the result of a spline function. The control points of the spline come from 4 sources:
-- pre-trajectory, these are point in the past, linear extension of the first vector of the previous trajectory
-- previous trajectory, 4 points from there, the zero point is the last one. These points are also the starting points of the result point list.
+- pre-trajectory, these are point in the past, linear extension of the first vector of the previous trajectory (magenta on the picture above)
+- previous trajectory, 4 points from there, the zero point is the last one. These points are also the starting points of the result point list. (cyan)
 - if there's no previous trajectory, the ego vehicle position
-- control points on the target lane center line
+- control points on the target lane center line (red, continues under yellow)
 
 The extra points in the past were necessary for shaping the spline.
 The few points from the previous trajectory sometimes weren't enough to properly shape the start of the trajectory, which is the most important part.
