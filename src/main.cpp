@@ -14,7 +14,6 @@
 #include "json.hpp"
 #include "spline.h"
 
-//#include <conio.h>
 // for convenience
 using nlohmann::json;
 using std::string;
@@ -41,6 +40,12 @@ double min_relaxed_acc_while_braking = 4; // m/s^2
 double maximum_jerk = 9;
 double maximum_acc = 8;
 
+double max_speed = 22.2; // 50 mph
+double car_length = 4.5;
+double safety_distance = 2;
+double keep_distance = 5;
+double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
+
 struct Car
 {
 	// input
@@ -63,8 +68,9 @@ struct Car
 	}
 };
 
-struct Map
+class Map
 {
+public:
 	struct Waypoint
 	{
 		Point ref; // reference pos
@@ -350,9 +356,118 @@ struct Map
 	}
 };
 
-
-struct SpeedController
+class LaneChangePlanner
 {
+public:
+	int calculate_target_lane(std::map<int, Car> &sensor_fusion_cars, int ego_lane, int target_lane, double ego_s, double ego_vs, double delta_t0)
+	{
+		double lane_speed[NUM_LANES];
+		double next_s_in_lane[NUM_LANES];
+		bool lane_open[NUM_LANES];
+		for (int i = 0; i < NUM_LANES; i++)
+		{
+			lane_speed[i] = max_speed;
+			next_s_in_lane[i] = 1000;
+			lane_open[i] = true;
+		}
+
+		if (fLog) fprintf(fLog, "ego lane %d target lane %d\n", ego_lane, target_lane);
+		for (auto &p : sensor_fusion_cars)
+		{
+			auto &other = p.second;
+			int lane = other.lane;
+			double s = other.predicted_s(delta_t0);
+			if (s > ego_s)
+			{
+				if (s < next_s_in_lane[lane])
+				{
+					next_s_in_lane[lane] = s;
+					if (s-ego_s<100)
+						lane_speed[lane] = other.vs;
+				}
+			}
+			if (fabs(ego_s - s) < car_length + safety_distance)
+			{
+				if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, other car at %.2f\n", lane, s);
+				lane_open[lane] = false;
+			}
+			// check if we could potentially break if it's ahead, or the other car won't crash into us if it's behind:
+			if (s > ego_s && other.vs < ego_vs)
+			{
+				double car_dist = s - ego_s - car_length - safety_distance;
+				double speed_diff = ego_vs - other.vs;
+				double decelerate_time = speed_diff / relaxed_acc;
+				double decelerate_dist = ego_vs * decelerate_time - speed_diff / 2 * decelerate_time;
+				if (fLog) fprintf(fLog, "checking car %d ahead in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
+					other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, decelerate_dist);
+
+				if (car_dist < decelerate_dist)
+				{
+					if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, can't decelerate to %.2f in %.2fm, dist %.2f\n", lane, other.vs, decelerate_dist, car_dist);
+					lane_open[lane] = false;
+				}
+			}
+			if (s<ego_s && other.vs>ego_vs && s+50>ego_s) // cars far away can have funny speed values
+			{
+				double car_dist = ego_s - s - car_length - safety_distance;
+				double speed_diff = other.vs - ego_vs;
+				double decelerate_time = speed_diff / relaxed_acc;
+				if (target_lane == ego_lane) // currently not switching lane, or returning
+					decelerate_time += 3; // we give it more space in case it won't break in time, but once we start lane change, try to finish it
+				double min_dist = speed_diff * decelerate_time;
+				if (fLog) fprintf(fLog, "checking car %d behind in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
+					other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, min_dist);
+				if (car_dist < min_dist)
+				{
+					if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, approaching car speed %.2f need %.2fm, dist %.2f\n", lane, other.vs, min_dist, car_dist);
+					lane_open[lane] = false;
+				}
+			}
+		}
+
+		int best_target_lane = ego_lane;
+		double best_score = 0;
+		double lane_score[NUM_LANES];
+		for (int lane = 0; lane < NUM_LANES; lane++)
+		{
+			lane_score[lane] = 0;
+			if (lane != ego_lane && !lane_open[lane]) continue;
+			double speed_score = std::min(lane_speed[lane] / max_speed, 1.0);
+			// too much noise in this:
+			//double ego_d_future = ego_d+ego_vd * 2;
+			//double lane_center_offset = map.get_lane_center_offset(lane);
+			//double distance_score = std::max(0.0, 1 - fabs(ego_d_future - lane_center_offset)/8); // roughly 0 for distant, 0.5 for next, 1 for same
+			double distance_score = 1 - fabs(target_lane - lane) / 2;
+			//if (target_lane != ego_lane && lane != target_lane) distance_score = 0; // if we already started lane change, prefer the target to minimize change of mind (have to finish maneuver in 3 sec)
+			double free_score = std::min(1.0, next_s_in_lane[lane] / 100);
+			double total_score = speed_score + distance_score / 2 + free_score;
+			if (fLog) fprintf(fLog, "lane %d: %.2f,%.2f,%.2f -> %.2f\n", lane, speed_score, distance_score, free_score, total_score);
+			lane_score[lane] = total_score;
+			if (total_score > best_score)
+			{
+				best_score = total_score;
+				best_target_lane = lane;
+			}
+		}
+		if (console_log) printf(" lane_scores %.2f %.2f %.2f best %d->%d", lane_score[0], lane_score[1], lane_score[2], ego_lane, best_target_lane);
+		if (abs(ego_lane - best_target_lane) > 1)
+		{
+			// check next lane instead
+			int next_lane = best_target_lane > ego_lane ? ego_lane + 1 : ego_lane - 1;
+			if (!lane_open[next_lane]) target_lane = ego_lane;
+			else target_lane = next_lane;
+		}
+		else
+		{
+			target_lane = best_target_lane;
+		}
+		return target_lane;
+	}
+};
+
+class SpeedController
+{
+public:
 	double start_speed;
 	double target_speed;
 	double target_time;
@@ -365,18 +480,19 @@ struct SpeedController
 	}
 };
 
-struct TrajectoryBuilder
+class TrajectoryBuilder
 {
+public:
 	double total_dist = 0;
-	vector<Point > waypoints;
-	void add_waypoint(Point p)
+	vector<Point > control_points;
+	void add_control_point(Point p)
 	{
-		if (waypoints.size() > 0)
+		if (control_points.size() > 0)
 		{
-			auto prev_p = waypoints.back();
+			auto prev_p = control_points.back();
 			total_dist += distance(prev_p.x, prev_p.y, p.x, p.y);
 		}
-		waypoints.push_back(p);
+		control_points.push_back(p);
 	}
 	
 	vector<Point> build(vector<Point> &prev_trajectory,
@@ -452,25 +568,8 @@ struct TrajectoryBuilder
 					pre_trajectory_start_pos.y + v_pre.y*i*pre_trajectory_point_dist));
 		}
 		//printf(" ego yaw %.2f angle %.2f", deg2rad(ego_yaw), angle);
-		add_waypoint(Point(pos_x, pos_y)); // startup
+		add_control_point(Point(pos_x, pos_y)); // startup
 
-		/*
-		int nNextWaypoint = map.reference_waypoint_id;
-		//ego_lane = 2;
-		// skip next waypoint if it's between car pos and end of fixed trajectory head
-		{
-			double s, d;
-			int lane;
-			map.lane_matching(pos_x, pos_y, s, d, lane, &nNextWaypoint, 1 << ego_lane);
-		}
-		//if (map.reference_waypoint_ratio[ego_lane] > 0.9) nNextWaypoint++; // prevent flukes
-		
-		for (int i = 0; i < 50 - path_size; ++i) {
-			Point p = map.get_waypoint(nNextWaypoint).lane_center[ego_lane];
-			add_waypoint(p.x, p.y);
-			if (total_dist > 50 && i>2) break;
-			nNextWaypoint = (nNextWaypoint + 1) % map.waypoints.size();
-		}*/
 		double min_control_point_dist = speed_controller.start_speed * 1;
 		min_control_point_dist = std::max(min_control_point_dist, 5.0); // at least 5 m
 		//double first_control_point_dist = min_control_point_dist; // first control point is to switch lane or return to center line
@@ -580,28 +679,29 @@ struct TrajectoryBuilder
 			int next_wp;
 			
 			Point next_pt = map.get_lane_pos(contol_point_start_s, target_lane, next_wp, waypoint_dist);
-			/*if (waypoint_dist < min_control_point_dist)
+			/* This didn't work out:
+			if (waypoint_dist < min_control_point_dist)
 			{
 				// if the next waypoint is closer than double min_control_point_dist, we skip the next control point,
 				// and add the waypoint instead to avoid cutting corners, or adding too dense control points which would make it jerk
 				double tmp_dist;
 				int tmp_wp;
 				//next_pt = map.get_lane_pos(contol_point_start_s- min_control_point_dist/2+waypoint_dist/2, target_lane, tmp_wp, tmp_dist);
-				//add_waypoint(next_pt);
-				add_waypoint(map.get_waypoint(next_wp).lane_center[target_lane]);
+				//add_control_point(next_pt);
+				add_control_point(map.get_waypoint(next_wp).lane_center[target_lane]);
 				contol_point_start_s += waypoint_dist;
 			}
 			else*/
 			{
-				add_waypoint(next_pt);
+				add_control_point(next_pt);
 			}
-			if (total_dist > 50 && waypoints.size() > 2) break;
+			if (total_dist > 50 && control_points.size() > 2) break;
 			contol_point_start_s += min_control_point_dist;
 		}
 
 		if (fLog)
 		{
-			fprintf(fLog, "first control dist %.2f\n", (Point(pos_x, pos_y) - waypoints[1]).length());
+			fprintf(fLog, "first control dist %.2f\n", (Point(pos_x, pos_y) - control_points[1]).length());
 			fprintf(fLog, "pre_control=[");
 			for (int i = 0; i < pre_trajectory_spline_control_points.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", pre_trajectory_spline_control_points[i].x, pre_trajectory_spline_control_points[i].y);
 			fprintf(fLog, "]\n");
@@ -609,18 +709,18 @@ struct TrajectoryBuilder
 			for (int i = 0; i < prev_trajectory.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", prev_trajectory[i].x, prev_trajectory[i].y);
 			fprintf(fLog, "]\n");
 			fprintf(fLog, "control_points=[");
-			for (int i = 0; i < waypoints.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", waypoints[i].x, waypoints[i].y);
+			for (int i = 0; i < control_points.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", control_points[i].x, control_points[i].y);
 			fprintf(fLog, "]\n");
 		}
 
 
-		// transform waypoints for spline
+		// transform control_points for spline
 		double cos_angle = cos(-angle);
 		double sin_angle = sin(-angle);
 		Point transform_center(pos_x, pos_y);
-		for (int i = 0; i < (int)waypoints.size(); i++)
+		for (int i = 0; i < (int)control_points.size(); i++)
 		{
-			Point &p = waypoints[i];
+			Point &p = control_points[i];
 			p = p - transform_center;
 			double tx = p.x*cos_angle - p.y*sin_angle;
 			double ty = p.x*sin_angle + p.y*cos_angle;
@@ -655,10 +755,10 @@ struct TrajectoryBuilder
 
 		tk::spline spline;
 		
-		for (int i = 0; i < (int)waypoints.size(); i++)
+		for (int i = 0; i < (int)control_points.size(); i++)
 		{
-			wp_x.push_back(waypoints[i].x);
-			wp_y.push_back(waypoints[i].y);
+			wp_x.push_back(control_points[i].x);
+			wp_y.push_back(control_points[i].y);
 		}
 
 		for (int i = 1; i < (int)wp_x.size(); i++)
@@ -682,10 +782,10 @@ struct TrajectoryBuilder
 			double speed = speed_controller.get_speed(current_t);
 			double current_angle = 0; // working in transformed space
 			int next_control_point = 1;
-			for (; result_points.size() < 50 && next_control_point<waypoints.size();)
+			for (; result_points.size() < 50 && next_control_point< control_points.size();)
 			{
 				double dist_step = speed / 50;
-				Point next_pt = waypoints[next_control_point];
+				Point next_pt = control_points[next_control_point];
 				Point current_p = Point(pos_x, pos_y);
 				Point next_delta = (next_pt - current_p);
 				double control_point_dist = next_delta.length();
@@ -785,14 +885,9 @@ struct TrajectoryBuilder
 	}
 };
 
-double max_speed = 22.2; // 50 mph
-double car_length = 4.5;
-double safety_distance = 2;
-double keep_distance = 5;
-double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
-
-struct LimitSpeed
+class LimitSpeed // limits the speed of the ego vehicle based when following single car
 {
+public:
 	double target_speed;
 	double target_time;
 	bool can_accelerate = true;
@@ -889,7 +984,6 @@ struct LimitSpeed
 		}
 		if (fLog) fprintf(fLog, "limitspeed %s for car %d in lane %d dist %.2f: %.2f in %.2f\n", code, follow_car.id, follow_car.lane, next_s - ego_s, target_speed, target_time);
 	}
-
 };
 
 //int jump_to_waypoint = 30; // traffic block
@@ -1092,106 +1186,8 @@ int main() {
 			  }
 		  }
 
-		  
-		  double lane_speed[NUM_LANES];
-		  double next_s_in_lane[NUM_LANES];
-		  bool lane_open[NUM_LANES];
-		  for (int i = 0; i < NUM_LANES; i++)
-		  {
-			  lane_speed[i] = max_speed;
-			  next_s_in_lane[i] = 1000;
-			  lane_open[i] = true;
-		  }
-
-		  if (fLog) fprintf(fLog, "ego lane %d target lane %d\n", ego_lane, target_lane);
-		  for (auto &p : sensor_fusion_cars)
-		  {
-			  auto &other = p.second;
-			  int lane = other.lane;
-			  double s = other.predicted_s(delta_t0);
-			  if (s > ego_s)
-			  {
-				  if (s < next_s_in_lane[lane])
-				  {
-					  next_s_in_lane[lane] = s;
-					  lane_speed[lane] = other.vs;
-				  }
-			  }
-			  if (fabs(ego_s - s) < car_length + safety_distance)
-			  {
-				  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, other car at %.2f\n", lane, s);
-				  lane_open[lane] = false;
-			  }
-			  // check if we could potentially break if it's ahead, or the other car won't crash into us if it's behind:
-			  if (s > ego_s && other.vs < ego_vs)
-			  {
-				  double car_dist = s - ego_s - car_length - safety_distance;
-				  double speed_diff = ego_vs - other.vs;
-				  double decelerate_time = speed_diff / relaxed_acc;
-				  double decelerate_dist = speed_diff / 2 * decelerate_time;
-				  if (fLog) fprintf(fLog, "checking car %d ahead in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
-					  other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, decelerate_dist);
-
-				  if (car_dist < decelerate_dist)
-				  {
-					  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, can't decelerate to %.2f in %.2fm, dist %.2f\n", lane, other.vs, decelerate_dist, car_dist);
-					  lane_open[lane] = false;
-				  }
-			  }
-			  if (s<ego_s && other.vs>ego_vs)
-			  {
-				  double car_dist = ego_s - s - car_length - safety_distance;
-				  double speed_diff = other.vs - ego_vs;
-				  double decelerate_time = speed_diff / relaxed_acc;
-				  if (target_lane == ego_lane) // currently not switching lane, or returning
-					  decelerate_time += 3; // we give it more space in case it won't break in time, but once we start lane change, try to finish it
-				  double min_dist = speed_diff * decelerate_time;
-				  if (fLog) fprintf(fLog, "checking car %d behind in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
-					  other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, min_dist);
-				  if (car_dist < min_dist)
-				  {
-					  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, approaching car speed %.2f need %.2fm, dist %.2f\n", lane, other.vs, min_dist, car_dist);
-					  lane_open[lane] = false;
-				  }
-			  }
-		  }
-
-		  int best_target_lane = ego_lane;
-		  double best_score = 0;
-		  double lane_score[NUM_LANES];
-		  for (int lane = 0; lane < NUM_LANES; lane++)
-		  {
-			  lane_score[lane] = 0;
-			  if (lane != ego_lane && !lane_open[lane]) continue;
-			  double speed_score = lane_speed[lane] / max_speed;
-			  // too much noise in this:
-			  //double ego_d_future = ego_d+ego_vd * 2;
-			  //double lane_center_offset = map.get_lane_center_offset(lane);
-			  //double distance_score = std::max(0.0, 1 - fabs(ego_d_future - lane_center_offset)/8); // roughly 0 for distant, 0.5 for next, 1 for same
-			  double distance_score = 1-fabs(target_lane - lane) / 2;
-			  //if (target_lane != ego_lane && lane != target_lane) distance_score = 0; // if we already started lane change, prefer the target to minimize change of mind (have to finish maneuver in 3 sec)
-			  double free_score = std::min(1.0, next_s_in_lane[lane] / 100);
-			  double total_score = speed_score + distance_score/2 + free_score;
-			  if (fLog) fprintf(fLog, "lane %d: %.2f,%.2f,%.2f -> %.2f\n", lane, speed_score, distance_score, free_score, total_score);
-			  lane_score[lane] = total_score;
-			  if (total_score > best_score)
-			  {
-				  best_score = total_score;
-				  best_target_lane = lane;
-			  }
-		  }
-		  if (console_log) printf(" lane_scores %.2f %.2f %.2f best %d->%d", lane_score[0], lane_score[1], lane_score[2], ego_lane, best_target_lane);
-		  if (abs(ego_lane - best_target_lane) > 1)
-		  {
-			  // check next lane instead
-			  int next_lane = best_target_lane > ego_lane ? ego_lane + 1 : ego_lane - 1;
-			  if (!lane_open[next_lane]) target_lane = ego_lane;
-			  else target_lane = next_lane;
-		  }
-		  else
-		  {
-			  target_lane = best_target_lane;
-		  }
+		  LaneChangePlanner lane_change_planner;
+		  target_lane = lane_change_planner.calculate_target_lane(sensor_fusion_cars, ego_lane, target_lane, ego_s, ego_vs, delta_t0);
 
 		  int next_car_id = -1;
 		  double next_s = 0;
@@ -1238,7 +1234,7 @@ int main() {
 		  double delta_to_max_speed = fabs(ego_speed - max_speed);
 		  speed_controller.target_time = delta_to_max_speed / relaxed_acc;
 
-		  LimitSpeed limit_speed_in_lane, limit_speed_in_target_lane;
+		  LimitSpeed limit_speed_in_lane, limit_speed_in_target_lane; // during lane change, we may have to adjust speed on 2 cars
 		  if (next_car_id != -1)
 		  {
 			  auto &follow_car = sensor_fusion_cars[next_car_id];
@@ -1266,12 +1262,6 @@ int main() {
 
 		  TrajectoryBuilder trajectory;
 		  
-		  /*if (_kbhit())
-		  {
-			  char ch = _getch();
-			  if (ch == 'A' || ch == 'a') target_lane = std::max(0, target_lane - 1);
-			  if (ch == 'D' || ch == 'd') target_lane = std::min(2, target_lane + 1);  
-		  }*/
 		  vector<Point> refined_trajectory = trajectory.build(prev_trajectory, ego_x, ego_y, ego_yaw, ego_lane, target_lane, ego_d, ego_vd, map, speed_controller);
 
 		  vector<double> next_x_vals(refined_trajectory.size());
@@ -1283,27 +1273,6 @@ int main() {
 			  next_y_vals[i] = refined_trajectory[i].y;
 		  }
 
-		  /*if (fLog != NULL)
-		  {
-			  double prev_heading = 0;
-			  for (int i = 0; i < (int)next_x_vals.size(); i++)
-			  {
-				  double heading = 0;
-				  double dist = 0;
-				  if (i != 0)
-				  {
-					  heading = atan2(next_y_vals[i] - next_y_vals[i - 1], next_x_vals[i] - next_x_vals[i - 1]);
-					  dist = distance(next_x_vals[i], next_y_vals[i], next_x_vals[i - 1], next_y_vals[i - 1]);
-				  }
-				  fprintf(fLog, "%.2f, %.2f, %.2f, %2f\n", next_x_vals[i], next_y_vals[i], dist, heading * 180 / pi());
-				  if (i >1 && fabs(heading - prev_heading) > 0.2)
-				  {
-					  int alma = 0;
-				  }
-				  prev_heading = heading;
-			  }
-			  fclose(fLog);
-		  }*/
 		  if (fLog) fflush(fLog);
 		  if (console_log) printf("\n");
           msgJson["next_x"] = next_x_vals;
