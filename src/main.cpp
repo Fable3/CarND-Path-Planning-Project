@@ -26,7 +26,7 @@ using std::vector;
 
 FILE *fLog = NULL;
 bool need_log = true;
-bool console_log = false;
+bool console_log = true;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -39,7 +39,7 @@ double relaxed_jerk = 5; // m/s^3
 double relaxed_acc = 5; // m/s^2
 double min_relaxed_acc_while_braking = 4; // m/s^2
 double maximum_jerk = 9;
-double maximum_acc = 9;
+double maximum_acc = 8;
 
 struct Car
 {
@@ -362,15 +362,6 @@ struct SpeedController
 		if (current_t > target_time) speed = target_speed;
 		else speed = start_speed + (target_speed - start_speed)*current_t / target_time;
 		return speed;
-	}
-	void maximize_acc(double acc)
-	{
-		double delta_v = target_speed - start_speed;
-		double min_time = fabs(delta_v) / acc;
-		if (target_time < min_time)
-		{
-			target_time = min_time;
-		}
 	}
 };
 
@@ -794,7 +785,112 @@ struct TrajectoryBuilder
 	}
 };
 
+double max_speed = 22.2; // 50 mph
+double car_length = 4.5;
+double safety_distance = 2;
+double keep_distance = 5;
+double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
 
+struct LimitSpeed
+{
+	double target_speed;
+	double target_time;
+	bool can_accelerate = true;
+
+	void maximize_acc(double ego_speed, double acc)
+	{
+		double delta_v = target_speed - ego_speed;
+		double min_time = fabs(delta_v) / acc;
+		if (target_time < min_time)
+		{
+			target_time = min_time;
+		}
+	}
+	void calculate(Car &follow_car, double next_s, double ego_s, double ego_speed, double ego_acc)
+	{
+		target_speed = max_speed;
+		double delta_to_max_speed = fabs(ego_speed - max_speed);
+		target_time = delta_to_max_speed / relaxed_acc;
+
+		double follow_car_distance = next_s - ego_s - car_length;
+		if (follow_car_distance < 0)
+		{
+			printf("detected collision\n");
+			follow_car_distance = 0; // collision already
+		}
+		double follow_car_speed = sqrt(follow_car.vx*follow_car.vx + follow_car.vy*follow_car.vy);
+		
+		const char *code = "FREEFLOW";
+		// check emergency breaking, safe distance
+		if (ego_speed > follow_car_speed)
+		{
+			double acc = relaxed_acc;
+			if (ego_acc < 0) acc = min_relaxed_acc_while_braking;
+			double delta_v = ego_speed - follow_car_speed;
+			double delta_t = delta_v / acc;
+			double delta_d = ego_speed * delta_t - delta_v / 2 * delta_t;
+			double max_dist = follow_car_distance - safety_distance;
+
+			if (delta_d > max_dist)
+			{
+				target_speed = follow_car_speed;
+				// we have max_dist to decelerate, so from max_dist = (ego_speed - delta_v / 2)*target_speed_time:
+				target_time = max_dist / (ego_speed - delta_v / 2);
+				// if max accel is reached, use up the safety distance:
+				if (target_time < EPSILON || delta_v / target_time>maximum_acc)
+				{
+					code = "MAXBRAKE";
+					if (console_log) printf(" MAXBRAKE");
+					if (fLog) fprintf(fLog, "maxbrake: need %.2f have %.2f delta v %.2f, target time %.2f acc %.2f\n",
+						delta_d, max_dist, delta_v, target_time, delta_v / target_time);
+					target_time = delta_v / maximum_acc;
+				}
+				else
+				{
+					code = "BRAKE";
+					if (console_log) printf(" BRAKE");
+					if (fLog) fprintf(fLog, "normalbrake: need %.2f have %.2f delta v %.2f, target time %.2f acc %.2f\n",
+						delta_d, max_dist, delta_v, target_time, delta_v / target_time);
+				}
+				can_accelerate = false;
+			}
+		}
+		if (can_accelerate) // maintain safe distance
+		{
+			double t_to_reach_optimal_distance = 1; // sec
+			double follow_car_predicted_pos = follow_car_speed * t_to_reach_optimal_distance + next_s;
+			double ego_car_predicted_pos = ego_speed * t_to_reach_optimal_distance + ego_s;
+
+			if (ego_s + car_length + keep_distance > next_s)
+			{
+				double excess_distance = ego_s + car_length + keep_distance - next_s; // negative when approaching
+
+				target_speed = follow_car_speed - excess_distance / t_to_reach_optimal_distance;
+				target_time = t_to_reach_optimal_distance;
+				maximize_acc(ego_speed, relaxed_acc);
+				can_accelerate = false;
+				code = "ADJUST";
+				if (console_log) printf(" ADJUST");
+
+				/*
+				vector<double> start = { ego_s, ego_speed, ego_acc };
+				vector<double> end = { follow_car_predicted_pos - car_length, follow_car_speed, 0 };
+				in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);*/
+			}
+			else if (ego_s + car_length + keep_distance + keep_distance_leeway > next_s)
+			{
+				// we maintain current speed, don't try to exacly maintain safety distance
+				target_speed = follow_car_speed;
+				target_time = 1.0;
+				maximize_acc(ego_speed, relaxed_acc);
+				if (console_log) printf(" KEEP");
+				code = "KEEP";
+			}
+		}
+		if (fLog) fprintf(fLog, "limitspeed %s for car %d in lane %d dist %.2f: %.2f in %.2f\n", code, follow_car.id, follow_car.lane, next_s - ego_s, target_speed, target_time);
+	}
+
+};
 
 //int jump_to_waypoint = 30; // traffic block
 int jump_to_waypoint = 0;
@@ -990,13 +1086,13 @@ int main() {
 				  map.project_speed(Point(car.vx, car.vy), next_wp_id, &car.vs, &car.vd);
 				  //car.s = car_data[5];
 				  //car.d = car_data[6];
+				  if (fLog) fprintf(fLog, "car %d at (%.2f,%.2f) speed (%.2f,%.2f) lane %d s %.2f d %.2f vs %.2f vd %.2f\n",
+					  car.id, car.x, car.y, car.vx, car.vy, car.lane, car.s, car.d, car.vs, car.vd);
+
 			  }
 		  }
 
-		  double max_speed = 22.2; // 50 mph
-		  double car_length = 4.5;
-		  double safety_distance = 2;
-
+		  
 		  double lane_speed[NUM_LANES];
 		  double next_s_in_lane[NUM_LANES];
 		  bool lane_open[NUM_LANES];
@@ -1033,6 +1129,9 @@ int main() {
 				  double speed_diff = ego_vs - other.vs;
 				  double decelerate_time = speed_diff / relaxed_acc;
 				  double decelerate_dist = speed_diff / 2 * decelerate_time;
+				  if (fLog) fprintf(fLog, "checking car %d ahead in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
+					  other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, decelerate_dist);
+
 				  if (car_dist < decelerate_dist)
 				  {
 					  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, can't decelerate to %.2f in %.2fm, dist %.2f\n", lane, other.vs, decelerate_dist, car_dist);
@@ -1047,6 +1146,8 @@ int main() {
 				  if (target_lane == ego_lane) // currently not switching lane, or returning
 					  decelerate_time += 3; // we give it more space in case it won't break in time, but once we start lane change, try to finish it
 				  double min_dist = speed_diff * decelerate_time;
+				  if (fLog) fprintf(fLog, "checking car %d behind in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
+					  other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, min_dist);
 				  if (car_dist < min_dist)
 				  {
 					  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, approaching car speed %.2f need %.2fm, dist %.2f\n", lane, other.vs, min_dist, car_dist);
@@ -1068,9 +1169,9 @@ int main() {
 			  //double lane_center_offset = map.get_lane_center_offset(lane);
 			  //double distance_score = std::max(0.0, 1 - fabs(ego_d_future - lane_center_offset)/8); // roughly 0 for distant, 0.5 for next, 1 for same
 			  double distance_score = 1-fabs(target_lane - lane) / 2;
-			  if (target_lane != ego_lane && lane != target_lane) distance_score = 1; // if we already started lane change, prefer the target to minimize change of mind (have to finish maneuver in 3 sec)
-			  double free_score = std::min(1.0, next_s_in_lane[lane] / 200);
-			  double total_score = speed_score + distance_score + free_score;
+			  //if (target_lane != ego_lane && lane != target_lane) distance_score = 0; // if we already started lane change, prefer the target to minimize change of mind (have to finish maneuver in 3 sec)
+			  double free_score = std::min(1.0, next_s_in_lane[lane] / 100);
+			  double total_score = speed_score + distance_score/2 + free_score;
 			  if (fLog) fprintf(fLog, "lane %d: %.2f,%.2f,%.2f -> %.2f\n", lane, speed_score, distance_score, free_score, total_score);
 			  lane_score[lane] = total_score;
 			  if (total_score > best_score)
@@ -1094,6 +1195,9 @@ int main() {
 
 		  int next_car_id = -1;
 		  double next_s = 0;
+		  int next_car_in_target_lane = -1;
+		  double next_s_in_target_lane = 0;
+		  double d_of_target_lane = map.get_lane_center_offset(target_lane);
 		  for (auto &p : sensor_fusion_cars)
 		  {
 			  auto &other = p.second;
@@ -1107,11 +1211,18 @@ int main() {
 					  next_s = s0;
 				  }
 			  }
+
+			  if (s0 >= ego_s - car_length - safety_distance && fabs(d0 - d_of_target_lane) < 3)
+			  {
+				  if (next_car_in_target_lane == -1 || next_s_in_target_lane > s0)
+				  {
+					  next_car_in_target_lane = other.id;
+					  next_s_in_target_lane = s0;
+				  }
+			  }
 		  }
+		  if (next_car_in_target_lane == next_car_id) next_car_in_target_lane = -1;// only check once
 		  
-		  double keep_distance = 5;
-		  double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
-	
 		  /*
 		  if (next_car_id != -1)
 		  {
@@ -1126,141 +1237,27 @@ int main() {
 		  speed_controller.target_speed = max_speed;
 		  double delta_to_max_speed = fabs(ego_speed - max_speed);
 		  speed_controller.target_time = delta_to_max_speed / relaxed_acc;
+
+		  LimitSpeed limit_speed_in_lane, limit_speed_in_target_lane;
 		  if (next_car_id != -1)
 		  {
-			  if (next_s - ego_s < 6)
-			  {
-				  int alma = 0;
-			  }
-			  vector<double> start = { ego_s, ego_speed, ego_acc };
-
 			  auto &follow_car = sensor_fusion_cars[next_car_id];
-			  double follow_car_distance = next_s - ego_s - car_length;
-			  if (follow_car_distance < 0)
-			  {
-				  printf("detected collision\n");
-				  follow_car_distance = 0; // collision already
-			  }
-			  double follow_car_speed = sqrt(follow_car.vx*follow_car.vx + follow_car.vy*follow_car.vy);
-			  bool can_accelerate = true;
-			  // check emergency breaking, safe distance
-			  if (ego_speed > follow_car_speed)
-			  {
-				  double acc = relaxed_acc;
-				  if (ego_acc < 0) acc = min_relaxed_acc_while_braking;
-				  double delta_v = ego_speed - follow_car_speed;
-				  double delta_t = delta_v / acc;
-				  double delta_d = ego_speed * delta_t - delta_v / 2 * delta_t;
-				  double max_dist = follow_car_distance - safety_distance;
-				  /*if (delta_d > max_dist)
-				  {
-					  // need to start breaking. The most efficient way to maintain safety distance is to pretend that the car ahead breaks at maximum deceleration and stops
-					  double time_for_follow_car_to_stop = follow_car_speed / maximum_acc;
-					  double extra_distance_while_stopping = time_for_follow_car_to_stop * follow_car_speed / 2;
-					  double follow_car_predicted_pos = next_s + extra_distance_while_stopping;
-					  // we reach the car pos in delta_t, plus the time to stop
-					  vector<double> end = { follow_car_predicted_pos - car_length - safety_distance, 0, 0 };
-					  in_lane_jmt_max_time = time_for_follow_car_to_stop + delta_t;
-					  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
-					  can_accelerate = false;
-
-				  }*/
-				  if (delta_d > max_dist)
-				  {
-					  speed_controller.target_speed = follow_car_speed;
-					  // we have max_dist to decelerate, so from max_dist = (ego_speed - delta_v / 2)*target_speed_time:
-					  speed_controller.target_time = max_dist / (ego_speed - delta_v / 2);
-					  // if max accel is reached, use up the safety distance:
-					  if (speed_controller.target_time < EPSILON || delta_v / speed_controller.target_time>maximum_acc)
-					  {
-						  if (console_log) printf(" MAXBRAKE");
-						  speed_controller.target_time = delta_v / maximum_acc;
-					  }
-					  else
-					  {
-						  if (console_log) printf(" BRAKE");
-					  }
-					  can_accelerate = false;
-				  }
-			  }
-			  if (can_accelerate) // maintain safe distance
-			  {
-				  double t_to_reach_optimal_distance = 1; // sec
-				  double follow_car_predicted_pos = follow_car_speed * t_to_reach_optimal_distance + next_s;
-				  double ego_car_predicted_pos = ego_speed * t_to_reach_optimal_distance + ego_s;
-
-				  if (ego_s + car_length + keep_distance > next_s)
-				  {
-					  double excess_distance = ego_s + car_length + keep_distance - next_s; // negative when approaching
-
-					  speed_controller.target_speed = follow_car_speed - excess_distance / t_to_reach_optimal_distance;
-					  speed_controller.target_time = t_to_reach_optimal_distance;
-					  speed_controller.maximize_acc(relaxed_acc);
-					  can_accelerate = false;
-					  if (console_log) printf(" ADJUST");
-
-					  /*
-					  vector<double> start = { ego_s, ego_speed, ego_acc };
-					  vector<double> end = { follow_car_predicted_pos - car_length, follow_car_speed, 0 };
-					  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);*/
-				  }
-				  else if (ego_s + car_length + keep_distance + keep_distance_leeway > next_s)
-				  {
-					  // we maintain current speed, don't try to exacly maintain safety distance
-					  speed_controller.target_speed = follow_car_speed;
-					  speed_controller.target_time = 1.0;
-					  speed_controller.maximize_acc(relaxed_acc);
-					  if (console_log) printf(" KEEP");
-				  }
-			  }
-			  /*double speed_diff = fabs(follow_car_speed - ego_speed);
-			  if (ego_speed > follow_car_speed && can_accelerate)
-			  {
-				  double collision_time = follow_car_distance / (ego_speed - follow_car_speed);
-				  if (collision_time > 10)
-				  {
-					  // follow car is far, can accelerate
-				  }
-				  else
-				  {
-					  // need to break, follow mode
-					  double follow_car_predicted_pos = follow_car_speed * collision_time + next_s;
-					  vector<double> end = { follow_car_predicted_pos - car_length - safety_distance, follow_car_speed, 0 };
-					  in_lane_jmt_max_time = collision_time;
-					  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
-					  
-					  can_accelerate = false;
-				  }
-			  }
-			  double follow_sync_time = 3; // if speed is no problem, match distance if it's in 3 seconds range
-			  if (can_accelerate && follow_car_distance<ego_speed*follow_sync_time) 
-			  {
-				  double follow_car_predicted_pos = follow_car_speed * follow_sync_time + next_s;
-				  vector<double> end = { follow_car_predicted_pos - car_length - safety_distance, follow_car_speed, 0 };
-				  in_lane_jmt_max_time = follow_sync_time;
-				  in_lane_jmt = JMT(start, end, in_lane_jmt_max_time);
-				  can_accelerate = false;
-			  }*/
-			  /*
-			  double t_to_reach_optimal_distance = 1; // sec
-			  double follow_car_predicted_pos = follow_car_speed * t_to_reach_optimal_distance + next_s;
-			  double ego_car_predicted_pos = ego_speed * t_to_reach_optimal_distance + ego_s;
-
-			  if (ego_s + car_length + safety_distance > next_s)
-			  {
-				  
-
-				  double excess_distance = ego_s + car_length - next_s; // negative when approaching
-				  
-				  
-				  max_speed = std::min(max_speed, follow_car_speed) - excess_distance / t_to_reach_optimal_distance;
-
-				  // should start from pos_x
-				  vector<double> start = { ego_s, ego_speed, ego_acc };
-				  vector<double> end = { follow_car_predicted_pos - car_length, follow_car_speed, 0 };
-				  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);
-			  }*/
+			  limit_speed_in_lane.calculate(follow_car, next_s, ego_s, ego_speed, ego_acc);
+			  speed_controller.target_speed = limit_speed_in_lane.target_speed;
+			  speed_controller.target_time = limit_speed_in_lane.target_time;
 		  }
+		  if (next_car_in_target_lane != -1)
+		  {
+			  auto &follow_car = sensor_fusion_cars[next_car_in_target_lane];
+			  limit_speed_in_target_lane.calculate(follow_car, next_s_in_target_lane, ego_s, ego_speed, ego_acc);
+			  // choose the lower:
+			  if (limit_speed_in_target_lane.target_speed < speed_controller.target_speed)
+			  {
+				  speed_controller.target_speed = limit_speed_in_target_lane.target_speed;
+				  speed_controller.target_time = limit_speed_in_target_lane.target_time;
+			  }
+		  }
+
 		  //printf(" target %.2f @ %.2f", speed_controller.target_speed, speed_controller.target_time);
 		  //if (in_lane_jmt.empty()) 
 		  //else printf(" JMT start speed %.2f end speed %.2f (%.2fs)", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
