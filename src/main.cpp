@@ -14,7 +14,7 @@
 #include "json.hpp"
 #include "spline.h"
 
-#include <conio.h>
+//#include <conio.h>
 // for convenience
 using nlohmann::json;
 using std::string;
@@ -25,6 +25,8 @@ using std::vector;
 #define EPSILON 1e-5
 
 FILE *fLog = NULL;
+bool need_log = true;
+bool console_log = false;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -400,9 +402,11 @@ struct TrajectoryBuilder
 		double pos_y;
 		double angle;
 		vector<Point> result_points = prev_trajectory;
+		vector<Point> pre_trajectory_spline_control_points;
+		Point pre_trajectory_start_pos(ego_x, ego_y);
 
-		int path_size = result_points.size();
 
+		int path_size = prev_trajectory.size();
 		if (path_size == 0) {
 			pos_x = ego_x;
 			pos_y = ego_y;
@@ -410,18 +414,51 @@ struct TrajectoryBuilder
 		}
 		else 
 		{
-			pos_x = result_points[path_size - 1].x;
-			pos_y = result_points[path_size - 1].y;
+			pre_trajectory_start_pos = prev_trajectory[0];
+			pos_x = prev_trajectory[path_size - 1].x;
+			pos_y = prev_trajectory[path_size - 1].y;
 			if (path_size == 1)
 			{
 				angle = deg2rad(ego_yaw);
 			}
 			else
 			{
-				double pos_x2 = result_points[path_size - 2].x;;
-				double pos_y2 = result_points[path_size - 2].y;
-				angle = atan2(pos_y - pos_y2, pos_x - pos_x2);
+				double pos_x2 = prev_trajectory[path_size - 2].x;;
+				double pos_y2 = prev_trajectory[path_size - 2].y;
+				Point v(pos_x - pos_x2, pos_y - pos_y2);
+				if (v.lengthsq() < EPSILON)
+					angle = deg2rad(ego_yaw);
+				else
+				{
+					angle = atan2(pos_y - pos_y2, pos_x - pos_x2);
+				}
 			}
+		}
+		bool pre_trajectory_from_angle = true;
+		double pre_trajectory_point_dist = 1.0;
+		Point v_pre; // normalized vector pointing backwards
+		if (prev_trajectory.size() >= 2)
+		{
+			v_pre = prev_trajectory[0] - prev_trajectory[1];
+			double v_pre_len = v_pre.length();
+			if (v_pre_len > EPSILON)
+			{
+				pre_trajectory_from_angle = false;
+				v_pre.x /= v_pre_len;
+				v_pre.y /= v_pre_len;
+			}
+		}
+		if (pre_trajectory_from_angle)
+		{
+			v_pre.x = -cos(angle);
+			v_pre.y = -sin(angle);
+		}
+		
+		for (int i = 3; i >=1; i--)
+		{
+			pre_trajectory_spline_control_points.push_back(
+				Point(pre_trajectory_start_pos.x + v_pre.x*i*pre_trajectory_point_dist, 
+					pre_trajectory_start_pos.y + v_pre.y*i*pre_trajectory_point_dist));
 		}
 		//printf(" ego yaw %.2f angle %.2f", deg2rad(ego_yaw), angle);
 		add_waypoint(Point(pos_x, pos_y)); // startup
@@ -528,15 +565,12 @@ struct TrajectoryBuilder
 			// if 4 meter, we just start the lane switch, need about 2 seconds
 			// if 6 meter, we might in the middle of an opposite lane change, need about 3 sec
 			//double lane_switch_time = 2.0 * d_diff/4.0+disalignment; // 2 seconds / 4 meter
-			double min_lane_switch_dist = 5.0;
+			double min_lane_switch_dist = 10.0;
 			double speed = speed_controller.start_speed;
 			double dist = speed * lane_switch_time;
 			if (dist < min_lane_switch_dist) dist = min_lane_switch_dist;
 			if (dist > 50) dist = 50; // for offroad
 			contol_point_start_s = dist;
-		}
-		//else
-		{
 		}
 		/*else
 		{
@@ -577,6 +611,9 @@ struct TrajectoryBuilder
 		if (fLog)
 		{
 			fprintf(fLog, "first control dist %.2f\n", (Point(pos_x, pos_y) - waypoints[1]).length());
+			fprintf(fLog, "pre_control=[");
+			for (int i = 0; i < pre_trajectory_spline_control_points.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", pre_trajectory_spline_control_points[i].x, pre_trajectory_spline_control_points[i].y);
+			fprintf(fLog, "]\n");
 			fprintf(fLog, "prev_trajectory=[");
 			for (int i = 0; i < prev_trajectory.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", prev_trajectory[i].x, prev_trajectory[i].y);
 			fprintf(fLog, "]\n");
@@ -600,6 +637,15 @@ struct TrajectoryBuilder
 			p.y = ty;
 		}
 		vector<double> wp_x, wp_y;
+		for (int i = 0; i < (int)pre_trajectory_spline_control_points.size(); i++)
+		{
+			Point &p = pre_trajectory_spline_control_points[i];
+			p = p - transform_center;
+			double tx = p.x*cos_angle - p.y*sin_angle;
+			double ty = p.x*sin_angle + p.y*cos_angle;
+			wp_x.push_back(tx);
+			wp_y.push_back(ty);
+		}
 		for (int i = 0; i < int(prev_trajectory.size()) - 1; i++)
 		{
 			Point &p = prev_trajectory[i];
@@ -610,7 +656,7 @@ struct TrajectoryBuilder
 			wp_x.push_back(tx);
 			wp_y.push_back(ty);
 		}
-
+		int min_control_point_count = wp_x.size(); // so far we only added previous points for shaping
 		pos_x = 0;
 		pos_y = 0;
 		cos_angle = cos(angle);
@@ -639,7 +685,7 @@ struct TrajectoryBuilder
 		double dist_total = 0;
 		double current_t = 0.02;
 
-		if (wp_x.size() < 3 || wp_x.size()<prev_trajectory.size() || fabs(ego_d)>20) // offroad is not good with splines
+		if (wp_x.size() < 3 || wp_x.size()<= min_control_point_count || fabs(ego_d)>20) // offroad is not good with splines
 		{
 			// not enough control points, can't generate spline, generate trajectory based on angle
 			double speed = speed_controller.get_speed(current_t);
@@ -721,7 +767,7 @@ struct TrajectoryBuilder
 					printf("\nspline warning, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
 					if (fLog) fprintf(fLog, "spline warning, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
 				}
-				if (current_t == 0.02) printf(" next sp %.2f", speed);
+				//if (current_t == 0.02) printf(" next sp %.2f", speed);
 				current_t += 0.02;
 				double sp_step = (x - pos_x)*dist_step / dist;
 				current_sp_arg += sp_step;
@@ -798,7 +844,6 @@ int main() {
   std::map<int, Car> sensor_fusion_cars;
   int target_lane = 1;
 
-  bool need_log = true;
   if (need_log)
   {
 	  fLog = fopen("trajectory.log", "wt");
@@ -807,7 +852,9 @@ int main() {
 	  fprintf(fLog, "]\n");
   }
 
-  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane]
+  int frame_count = 0;
+
+  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane, &frame_count]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -911,8 +958,10 @@ int main() {
 		  }
 		  double ego_vs, ego_vd;
 		  map.project_speed(ego_speed_vector, map.reference_waypoint_id, &ego_vs, &ego_vd);
-		  printf("v% 4.2f a% 4.2f d% 4.2f vd % 4.2f", ego_speed, ego_acc, ego_d, ego_vd);
-		  if (fLog) fprintf(fLog, "v%.2f a%.2f d%.2f\n", ego_speed, ego_acc, ego_d);
+		  if (console_log) printf("%04d v% 4.2f a% 4.2f d% 4.2f vd % 4.2f", frame_count, ego_speed, ego_acc, ego_d, ego_vd);
+		  
+		  if (fLog) fprintf(fLog, "%04d v%.2f a%.2f d%.2f\n", frame_count, ego_speed, ego_acc, ego_d);
+		  frame_count++;
 
 		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
 		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
@@ -944,6 +993,105 @@ int main() {
 			  }
 		  }
 
+		  double max_speed = 22.2; // 50 mph
+		  double car_length = 4.5;
+		  double safety_distance = 2;
+
+		  double lane_speed[NUM_LANES];
+		  double next_s_in_lane[NUM_LANES];
+		  bool lane_open[NUM_LANES];
+		  for (int i = 0; i < NUM_LANES; i++)
+		  {
+			  lane_speed[i] = max_speed;
+			  next_s_in_lane[i] = 1000;
+			  lane_open[i] = true;
+		  }
+
+		  if (fLog) fprintf(fLog, "ego lane %d target lane %d\n", ego_lane, target_lane);
+		  for (auto &p : sensor_fusion_cars)
+		  {
+			  auto &other = p.second;
+			  int lane = other.lane;
+			  double s = other.predicted_s(delta_t0);
+			  if (s > ego_s)
+			  {
+				  if (s < next_s_in_lane[lane])
+				  {
+					  next_s_in_lane[lane] = s;
+					  lane_speed[lane] = other.vs;
+				  }
+			  }
+			  if (fabs(ego_s - s) < car_length + safety_distance)
+			  {
+				  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, other car at %.2f\n", lane, s);
+				  lane_open[lane] = false;
+			  }
+			  // check if we could potentially break if it's ahead, or the other car won't crash into us if it's behind:
+			  if (s > ego_s && other.vs < ego_vs)
+			  {
+				  double car_dist = s - ego_s - car_length - safety_distance;
+				  double speed_diff = ego_vs - other.vs;
+				  double decelerate_time = speed_diff / relaxed_acc;
+				  double decelerate_dist = speed_diff / 2 * decelerate_time;
+				  if (car_dist < decelerate_dist)
+				  {
+					  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, can't decelerate to %.2f in %.2fm, dist %.2f\n", lane, other.vs, decelerate_dist, car_dist);
+					  lane_open[lane] = false;
+				  }
+			  }
+			  if (s<ego_s && other.vs>ego_vs)
+			  {
+				  double car_dist = ego_s - s - car_length - safety_distance;
+				  double speed_diff = other.vs - ego_vs;
+				  double decelerate_time = speed_diff / relaxed_acc;
+				  if (target_lane == ego_lane) // currently not switching lane, or returning
+					  decelerate_time += 3; // we give it more space in case it won't break in time, but once we start lane change, try to finish it
+				  double min_dist = speed_diff * decelerate_time;
+				  if (car_dist < min_dist)
+				  {
+					  if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, approaching car speed %.2f need %.2fm, dist %.2f\n", lane, other.vs, min_dist, car_dist);
+					  lane_open[lane] = false;
+				  }
+			  }
+		  }
+
+		  int best_target_lane = ego_lane;
+		  double best_score = 0;
+		  double lane_score[NUM_LANES];
+		  for (int lane = 0; lane < NUM_LANES; lane++)
+		  {
+			  lane_score[lane] = 0;
+			  if (lane != ego_lane && !lane_open[lane]) continue;
+			  double speed_score = lane_speed[lane] / max_speed;
+			  // too much noise in this:
+			  //double ego_d_future = ego_d+ego_vd * 2;
+			  //double lane_center_offset = map.get_lane_center_offset(lane);
+			  //double distance_score = std::max(0.0, 1 - fabs(ego_d_future - lane_center_offset)/8); // roughly 0 for distant, 0.5 for next, 1 for same
+			  double distance_score = 1-fabs(target_lane - lane) / 2;
+			  if (target_lane != ego_lane && lane != target_lane) distance_score = 1; // if we already started lane change, prefer the target to minimize change of mind (have to finish maneuver in 3 sec)
+			  double free_score = std::min(1.0, next_s_in_lane[lane] / 200);
+			  double total_score = speed_score + distance_score + free_score;
+			  if (fLog) fprintf(fLog, "lane %d: %.2f,%.2f,%.2f -> %.2f\n", lane, speed_score, distance_score, free_score, total_score);
+			  lane_score[lane] = total_score;
+			  if (total_score > best_score)
+			  {
+				  best_score = total_score;
+				  best_target_lane = lane;
+			  }
+		  }
+		  if (console_log) printf(" lane_scores %.2f %.2f %.2f best %d->%d", lane_score[0], lane_score[1], lane_score[2], ego_lane, best_target_lane);
+		  if (abs(ego_lane - best_target_lane) > 1)
+		  {
+			  // check next lane instead
+			  int next_lane = best_target_lane > ego_lane ? ego_lane + 1 : ego_lane - 1;
+			  if (!lane_open[next_lane]) target_lane = ego_lane;
+			  else target_lane = next_lane;
+		  }
+		  else
+		  {
+			  target_lane = best_target_lane;
+		  }
+
 		  int next_car_id = -1;
 		  double next_s = 0;
 		  for (auto &p : sensor_fusion_cars)
@@ -960,17 +1108,17 @@ int main() {
 				  }
 			  }
 		  }
-		  double car_length = 4.5;
-		  double safety_distance = 2;
+		  
 		  double keep_distance = 5;
 		  double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
-		  double max_speed = 22.2; // 50 mph
+	
+		  /*
 		  if (next_car_id != -1)
 		  {
 			  auto &car = sensor_fusion_cars[next_car_id];
 			  printf(" next (%.2f, %.2f) v (%.2f, %.2f) s_dist: %.2f lane %d",
 				  car.s, car.d, car.vs, car.vd, next_s-ego_s, car.lane);
-		  }
+		  }*/
 		  //vector<double> in_lane_jmt;
 		  //double in_lane_jmt_max_time = 0;
 		  SpeedController speed_controller;
@@ -990,7 +1138,7 @@ int main() {
 			  double follow_car_distance = next_s - ego_s - car_length;
 			  if (follow_car_distance < 0)
 			  {
-				  printf("detected collision");
+				  printf("detected collision\n");
 				  follow_car_distance = 0; // collision already
 			  }
 			  double follow_car_speed = sqrt(follow_car.vx*follow_car.vx + follow_car.vy*follow_car.vy);
@@ -1025,12 +1173,12 @@ int main() {
 					  // if max accel is reached, use up the safety distance:
 					  if (speed_controller.target_time < EPSILON || delta_v / speed_controller.target_time>maximum_acc)
 					  {
-						  printf(" MAXBRAKE");
+						  if (console_log) printf(" MAXBRAKE");
 						  speed_controller.target_time = delta_v / maximum_acc;
 					  }
 					  else
 					  {
-						  printf(" BRAKE");
+						  if (console_log) printf(" BRAKE");
 					  }
 					  can_accelerate = false;
 				  }
@@ -1049,7 +1197,7 @@ int main() {
 					  speed_controller.target_time = t_to_reach_optimal_distance;
 					  speed_controller.maximize_acc(relaxed_acc);
 					  can_accelerate = false;
-					  printf(" ADJUST");
+					  if (console_log) printf(" ADJUST");
 
 					  /*
 					  vector<double> start = { ego_s, ego_speed, ego_acc };
@@ -1062,7 +1210,7 @@ int main() {
 					  speed_controller.target_speed = follow_car_speed;
 					  speed_controller.target_time = 1.0;
 					  speed_controller.maximize_acc(relaxed_acc);
-					  printf(" KEEP");
+					  if (console_log) printf(" KEEP");
 				  }
 			  }
 			  /*double speed_diff = fabs(follow_car_speed - ego_speed);
@@ -1113,7 +1261,7 @@ int main() {
 				  in_lane_jmt = JMT(start, end, t_to_reach_optimal_distance);
 			  }*/
 		  }
-		  printf(" target %.2f @ %.2f", speed_controller.target_speed, speed_controller.target_time);
+		  //printf(" target %.2f @ %.2f", speed_controller.target_speed, speed_controller.target_time);
 		  //if (in_lane_jmt.empty()) 
 		  //else printf(" JMT start speed %.2f end speed %.2f (%.2fs)", get_jmt_speed(in_lane_jmt, 0), get_jmt_speed(in_lane_jmt, in_lane_jmt_max_time), in_lane_jmt_max_time);
 
@@ -1121,13 +1269,12 @@ int main() {
 
 		  TrajectoryBuilder trajectory;
 		  
-		  if (_kbhit())
+		  /*if (_kbhit())
 		  {
 			  char ch = _getch();
 			  if (ch == 'A' || ch == 'a') target_lane = std::max(0, target_lane - 1);
-			  if (ch == 'D' || ch == 'd') target_lane = std::min(2, target_lane + 1);
-			  
-		  }
+			  if (ch == 'D' || ch == 'd') target_lane = std::min(2, target_lane + 1);  
+		  }*/
 		  vector<Point> refined_trajectory = trajectory.build(prev_trajectory, ego_x, ego_y, ego_yaw, ego_lane, target_lane, ego_d, ego_vd, map, speed_controller);
 
 		  vector<double> next_x_vals(refined_trajectory.size());
@@ -1161,7 +1308,7 @@ int main() {
 			  fclose(fLog);
 		  }*/
 		  if (fLog) fflush(fLog);
-		  printf("\n");
+		  if (console_log) printf("\n");
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
