@@ -6,3 +6,4 @@ src/.vs/
 src/CarND-Path-Planning-Project.vcxproj.user
 src/trajectory.log*
 todo.txt
+.ipynb_checkpoints/DrawLines-checkpoint.ipynb

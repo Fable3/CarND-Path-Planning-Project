@@ -938,7 +938,7 @@ int main() {
 			  }
 			  else
 			  {
-				  map.project_speed(Point(car.vx, car.vy), next_wp_id, &car.s, &car.d);
+				  map.project_speed(Point(car.vx, car.vy), next_wp_id, &car.vs, &car.vd);
 				  //car.s = car_data[5];
 				  //car.d = car_data[6];
 			  }
