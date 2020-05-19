@@ -24,9 +24,9 @@ using std::vector;
 #define EPSILON 1e-5
 
 FILE *fLog = NULL;
-bool need_log = false;
+bool need_log = true;
 bool console_log = false;
-bool sparse_console_log = false;
+bool sparse_console_log = true;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -814,8 +814,9 @@ public:
 		int min_control_point_count = wp_x.size(); // so far we only added previous points for shaping
 		pos_x = 0;
 		pos_y = 0;
-		cos_angle = cos(angle);
-		sin_angle = sin(angle);
+		double transform_angle = angle;
+		cos_angle = cos(transform_angle);
+		sin_angle = sin(transform_angle);
 
 		tk::spline spline;
 		
@@ -925,8 +926,8 @@ public:
 
 				// we now have a general direction, just have to update speed or decrease angle change to keep below target acceleration
 				double acceleration = fabs(speed - prev_speed)*50;
-				double angle = atan2(y - pos_y, x - pos_x);
-				double angle_diff = fmod(angle - prev_angle + 3 * pi(), 2 * pi()) - pi();
+				double angle_step = atan2(y - pos_y, x - pos_x);
+				double angle_diff = fmod(angle_step - prev_angle + 3 * pi(), 2 * pi()) - pi();
 				// from: rad_per_sec = speed / min_radius and angle_step = rad_per_sec / 50
 				//double turn_radius = speed / 50 / fabs(angle_diff);
 				// from radius = speed^2/acc -> centrifugal_acceleration = speed * speed / turn_radius
@@ -936,34 +937,81 @@ public:
 				{
 					// need to intervent, either by smoothing the angle or reducing acceleration
 					// reduced acceleration is more simple:
-					double new_acceleration = maximum_acc - centrifugal_acceleration;
-					if (new_acceleration < 0)
+					if (speed > prev_speed) // limit to acceleration and not braking
 					{
-						if (fLog) fprintf(fLog, "accT too high, accN=%.2f accT=%.2f\n", centrifugal_acceleration, acceleration);
-						new_acceleration = 0;
-					} 
-					
-					double new_speed;
-					if (speed > prev_speed)
-					{
-						new_speed = prev_speed + new_acceleration / 50;
+						double new_acceleration = maximum_acc - centrifugal_acceleration;
+						if (new_acceleration < 0)
+						{
+							if (fLog) fprintf(fLog, "accT too high, accN=%.2f accT=%.2f\n", centrifugal_acceleration, acceleration);
+							new_acceleration = 0;
+						}
+
+						double new_speed;
+						if (speed > prev_speed)
+						{
+							new_speed = prev_speed + new_acceleration / 50;
+						}
+						else 
+						{
+							// if still adjusting braking
+							new_speed = prev_speed - new_acceleration / 50;
+						}
+						if (fLog) fprintf(fLog, "acceleration override, accN=%.2f accT=%.2f -> %.2f speed %.2f -> %.2f\n", centrifugal_acceleration, acceleration, new_acceleration, speed, new_speed);
+						// reset speed control to new value: (todo)
+						speed_controller.override_speed(current_t, new_speed);
+						speed = new_speed;
+						speed_controller.target_time += 0.02;
+						dist_step = speed / 50;
+						acceleration = new_acceleration;
 					}
-					else
+					if (acceleration + centrifugal_acceleration > maximum_acc)
 					{
-						new_speed = prev_speed - new_acceleration / 50;
+						double new_centrifugal_acceleration = maximum_acc - acceleration;
+						if (new_centrifugal_acceleration < 0)
+						{
+							if (fLog) fprintf(fLog, "accN too high (overbraking?), accN=%.2f accT=%.2f\n", centrifugal_acceleration, acceleration);
+							new_centrifugal_acceleration = 0;
+						}
+						if (fLog) fprintf(fLog, "adjusting curvature, accN=%.2f -> %.2f accT=%.2f\n", centrifugal_acceleration, new_centrifugal_acceleration, acceleration);
+						// from double centrifugal_acceleration = speed * 50 * fabs(angle_diff);
+						double new_angle_diff = new_centrifugal_acceleration / speed / 50;
+						if (angle_diff < 0) new_angle_diff *= -1;
+						double new_angle = angle_step + angle_diff;
+						// need to recalculate transform center, 
+						// rotate around pos_x and pos_y with new_angle_diff, 
+						// and calculate new transform center with transform_angle+new_angle_diff going through pos_x, pos_y
+						// for that, we need to rotate transform_center around transformed(pos_x,posy) with new_angle_diff
+						// transform back pos:
+						Point tp;
+						tp.x = pos_x * cos_angle - pos_y * sin_angle;
+						tp.y = pos_x * sin_angle + pos_y * cos_angle;
+						tp = tp + transform_center;
+						// rotate transform center around tp:
+						Point vect = transform_center - tp;
+						Point rotated_vect;
+						rotated_vect.x = vect.x*cos(new_angle_diff) - vect.y*sin(new_angle_diff);
+						rotated_vect.y = vect.x*sin(new_angle_diff) + vect.y*cos(new_angle_diff);
+						transform_center = tp + rotated_vect;
+						transform_angle += new_angle_diff;
+						cos_angle = cos(transform_angle);
+						sin_angle = sin(transform_angle);
+						// just testing, pos_x, posy should be the same:
+						Point tp_save = tp;
+						tp.x = pos_x * cos_angle - pos_y * sin_angle;
+						tp.y = pos_x * sin_angle + pos_y * cos_angle;
+						tp = tp + transform_center;
+						if ((tp_save - tp).lengthsq() > EPSILON)
+						{
+							if (fLog) fprintf(fLog, "transform calculation error, angle: %.2f around pos %.2f, %.2f got back %.2f,%.2f\n",
+								new_angle_diff, tp_save.x, tp_save.y, tp.x, tp.y);
+						}
 					}
-					if (fLog) fprintf(fLog, "acceleration override, accN=%.2f accT=%.2f -> %.2f speed %.2f -> %.2f\n", centrifugal_acceleration, acceleration, new_acceleration, speed, new_speed);
-					// reset speed control to new value: (todo)
-					speed_controller.override_speed(current_t, new_speed);
-					speed = new_speed;
-					speed_controller.target_time += 0.02;
-					dist_step = speed / 50;
 				}
 				
 				//if (current_t == 0.02) printf(" next sp %.2f", speed);
 				current_t += 0.02;
 				prev_speed = speed;
-				prev_angle = angle;
+				prev_angle = angle_step;
 				double sp_step = (x - pos_x)*dist_step / dist;
 				pos_y += (y - pos_y)*dist_step / dist;
 				current_sp_arg += sp_step;
