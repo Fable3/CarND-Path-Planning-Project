@@ -25,8 +25,9 @@ using std::vector;
 
 FILE *fLog = NULL;
 bool need_log = true;
-bool console_log = false;
-bool sparse_console_log = true;
+bool console_log = true;
+bool sparse_console_log = false;
+bool test_fast_lane_change = false;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -38,7 +39,7 @@ void error_condition(const char *filename, int line, const char *text)
 double relaxed_acc = 5; // m/s^2
 double min_relaxed_acc_while_braking = 4; // m/s^2
 double maximum_jerk = 9;
-double maximum_acc = 8;
+double maximum_acc = 7;
 
 double max_speed = 22.2; // 50 mph
 double car_length = 4.5;
@@ -457,6 +458,7 @@ public:
 			double distance_score = 1 - fabs(target_lane - lane) / 2;
 			//if (target_lane != ego_lane && lane != target_lane) distance_score = 0; // if we already started lane change, prefer the target to minimize change of mind (have to finish maneuver in 3 sec)
 			double free_score = std::min(1.0, next_s_in_lane[lane] / 100);
+			if (test_fast_lane_change) distance_score = 0;
 			double total_score = speed_score + distance_score / 2 + free_score;
 			if (fLog) fprintf(fLog, "lane %d: %.2f,%.2f,%.2f -> %.2f\n", lane, speed_score, distance_score, free_score, total_score);
 			lane_score[lane] = total_score;
@@ -634,7 +636,7 @@ public:
 		//printf(" ego yaw %.2f angle %.2f", deg2rad(ego_yaw), angle);
 		add_control_point(Point(pos_x, pos_y)); // startup
 
-		double min_control_point_dist = speed_controller.start_speed * 1;
+		double min_control_point_dist = speed_controller.start_speed * 1.5;
 		min_control_point_dist = std::max(min_control_point_dist, 5.0); // at least 5 m
 		//double first_control_point_dist = min_control_point_dist; // first control point is to switch lane or return to center line
 		double contol_point_start_s = 0;
@@ -719,12 +721,13 @@ public:
 			// if 4 meter, we just start the lane switch, need about 2 seconds
 			// if 6 meter, we might in the middle of an opposite lane change, need about 3 sec
 			//double lane_switch_time = 2.0 * d_diff/4.0+disalignment; // 2 seconds / 4 meter
-			double min_lane_switch_dist = 10.0;
+			double min_lane_switch_dist = 15.0;
 			double speed = speed_controller.start_speed;
 			double dist = speed * lane_switch_time;
 			if (dist < min_lane_switch_dist) dist = min_lane_switch_dist;
 			if (dist > 50) dist = 50; // for offroad
 			contol_point_start_s = dist;
+			if (fLog) fprintf(fLog, "lane switch time = %.2f raw %.2f dist=%.2f increment %.2f\n", lane_switch_time, speed * lane_switch_time, dist, min_control_point_dist);
 		}
 		/*else
 		{
@@ -967,12 +970,13 @@ public:
 					if (acceleration + centrifugal_acceleration > maximum_acc)
 					{
 						double new_centrifugal_acceleration = maximum_acc - acceleration;
+						
 						if (new_centrifugal_acceleration < 0)
 						{
 							if (fLog) fprintf(fLog, "accN too high (overbraking?), accN=%.2f accT=%.2f\n", centrifugal_acceleration, acceleration);
 							new_centrifugal_acceleration = 0;
 						}
-						if (fLog) fprintf(fLog, "adjusting curvature, accN=%.2f -> %.2f accT=%.2f\n", centrifugal_acceleration, new_centrifugal_acceleration, acceleration);
+						if (fLog) fprintf(fLog, "adjusting curvature for pt %d, accN=%.2f -> %.2f accT=%.2f\n", result_points.size(), centrifugal_acceleration, new_centrifugal_acceleration, acceleration);
 						// from double centrifugal_acceleration = speed * 50 * fabs(angle_diff);
 						double new_angle_diff = new_centrifugal_acceleration / speed / 50;
 						if (angle_diff < 0) new_angle_diff *= -1;
@@ -1203,8 +1207,9 @@ int main() {
   }
 
   int frame_count = 0;
+  bool lane_change_complete = true;
 
-  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane, &frame_count]
+  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane, &lane_change_complete, &frame_count]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -1353,6 +1358,31 @@ int main() {
 
 		  LaneChangePlanner lane_change_planner;
 		  target_lane = lane_change_planner.calculate_target_lane(sensor_fusion_cars, ego_lane, target_lane, ego_s, ego_vs, delta_t0);
+		  // check if we're off center to the other direction:
+		  if (target_lane != ego_lane)
+		  {
+			  double d_of_target_lane = map.get_lane_center_offset(target_lane);
+			  double predict_t = 1.0; //sec, see where the car would be
+			  double lane_d_diff = fabs(ego_vd*predict_t + ego_d - d_of_target_lane);
+			  if (fLog) fprintf(fLog, "checking lane switch to %d: diff %.2f ego d %.2f vd %.2f\n", target_lane, lane_d_diff, ego_d, ego_vd);
+			  if (lane_d_diff > 6.0)
+			  {
+				  if (fLog) fprintf(fLog, "target lane too far: %.2f ego d %.2f vd %.2f, keep in lane\n", lane_d_diff, ego_d, ego_vd);
+				  target_lane = ego_lane;
+			  }
+		  }
+		  if (target_lane != ego_lane) lane_change_complete = false;
+
+		  if (target_lane == ego_lane && !lane_change_complete)
+		  {
+			  double d_of_target_lane = map.get_lane_center_offset(target_lane);
+			  double lane_d_diff = fabs(ego_d - d_of_target_lane);
+			  if (lane_d_diff < 0.5)
+			  {
+				  if (fLog) fprintf(fLog, "lane change complete to lane %d, d=%.2f\n", ego_lane, ego_d);
+				  lane_change_complete = true;
+			  }
+		  }
 
 		  int next_car_id = -1;
 		  double next_s = 0;
