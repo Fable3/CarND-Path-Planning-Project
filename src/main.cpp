@@ -42,7 +42,7 @@ double maximum_acc = 8;
 double max_speed = 22.2; // 50 mph
 double car_length = 4.5;
 double safety_distance = 2;
-double keep_distance = 5;
+double keep_distance = 10;
 double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
 
 struct Car
@@ -508,6 +508,14 @@ public:
 		double new_time_mod = std::max(new_target_time, 0.02);
 		double current_grade = (target_speed - start_speed) / target_time;
 		double new_grade = (new_target_speed - start_speed) / new_target_time;
+		if (fLog)
+		{
+			if (target_speed != max_speed && new_target_speed != max_speed)
+			{
+				fprintf(fLog, "SpeedController start %.2f prev target %.2f at %.2f grade %.2f, new target at %.2f at %.2f grade %.2f\n",
+					start_speed, target_speed, target_time, current_grade, new_target_speed, new_target_time, new_grade);
+			}
+		}
 		if (new_grade < current_grade)
 		{
 			target_speed =new_target_speed;
@@ -825,7 +833,7 @@ public:
 				Point current_p = Point(pos_x, pos_y);
 				Point next_delta = (next_pt - current_p);
 				double control_point_dist = next_delta.length();
-				if (control_point_dist < dist_step)
+				if (control_point_dist < 5) // approach 5 meter radius, we may not reach the control point exactly due to angle constraints
 				{
 					next_control_point++;
 					continue;
@@ -836,11 +844,9 @@ public:
 					double next_control_point_angle = atan2(next_delta.y, next_delta.x);
 					double angle_diff = fmod(next_control_point_angle - current_angle + 3 * pi(), 2 * pi()) - pi();
 					// v=sqrt(radius)*const, so radius = v^2*K. Also, turn radius is minimum 10 meters.
-					// example values:
-					// 100 m -> 13.4 m/s (K=1/180)
-					// 200 m -> 17.88 m/s (K=1/160)
-					// 300m -> 20 m/s (K=1/133)
-					double min_radius = std::max(10.0, speed*speed / 150);
+					// Tried in simulator, K is about 1/centrifugal force.
+					double max_acceleration = 4; // m/s^2
+					double min_radius = std::max(10.0, speed*speed / max_acceleration); // limit to 4 m/s^2
 					// with this speed, we complete the 2pi circle t= min_radius*2*pi/speed
 					// so in sec/rad: min_radius/speed
 					// we need rad/sec: speed/min_radius
