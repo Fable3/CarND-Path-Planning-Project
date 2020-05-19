@@ -14,7 +14,9 @@ After tweaking with lane score weights, the 30 minutes performance improved to 2
 
 ![30min_improved.png](30min_improved.png)
 
-[![Completed lap](https://img.youtube.com/vi/dkDTlqoc6KE/0.jpg)](https://www.youtube.com/watch?v=dkDTlqoc6KE)
+Here's a recorded lap on Youtube:
+
+[![Completed lap](thumbnail.png)](https://www.youtube.com/watch?v=dkDTlqoc6KE)
 
 ### Overview
 
