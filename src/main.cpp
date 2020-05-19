@@ -24,8 +24,8 @@ using std::vector;
 #define EPSILON 1e-5
 
 FILE *fLog = NULL;
-bool need_log = false;
-bool console_log = false;
+bool need_log = true;
+bool console_log = true;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -381,19 +381,36 @@ public:
 				if (s < next_s_in_lane[lane])
 				{
 					next_s_in_lane[lane] = s;
-					if (s-ego_s<100)
-						lane_speed[lane] = other.vs;
+					double max_dist_for_speed = 200; // m
+					if (s - ego_s < max_dist_for_speed)
+					{
+						double cutoff_dist_for_speed = 100; // m
+						// over 200 meters it's unreliable, but we want to avoid sudden jumps in scores just because a car appears 200 m ahead
+						// so between 100 and 200 meters, the speed is handed gradually
+						
+						int speed = other.vs;
+						if (speed > max_speed) speed = max_speed;
+						if (s - ego_s > cutoff_dist_for_speed)
+						{
+							// linear fit in the [100m,200m] range for [speed, max_speed]:
+							speed = speed + (max_speed - speed)*(s - ego_s - cutoff_dist_for_speed) / (max_dist_for_speed - cutoff_dist_for_speed);
+						}
+						lane_speed[lane] = speed;
+					}
 				}
 			}
-			if (fabs(ego_s - s) < car_length + safety_distance)
+			double additional_safety_distance_for_lane_change = 2; // added treshold to avoid aborted lane change
+			if (target_lane == lane) additional_safety_distance_for_lane_change = 0; // already decided to change lane, work with normal safety
+			double min_dist = car_length + safety_distance + additional_safety_distance_for_lane_change;
+			if (fabs(ego_s - s) < min_dist)
 			{
-				if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, other car at %.2f\n", lane, s);
+				if (fLog && lane_open[lane]) if (fLog) fprintf(fLog, "lane %d closed, car %d at %.2f inside range %.2f\n", lane, other.id, s, min_dist);
 				lane_open[lane] = false;
 			}
 			// check if we could potentially break if it's ahead, or the other car won't crash into us if it's behind:
 			if (s > ego_s && other.vs < ego_vs)
 			{
-				double car_dist = s - ego_s - car_length - safety_distance;
+				double car_dist = s - ego_s - car_length - safety_distance - additional_safety_distance_for_lane_change;
 				double speed_diff = ego_vs - other.vs;
 				double decelerate_time = speed_diff / relaxed_acc;
 				double decelerate_dist = ego_vs * decelerate_time - speed_diff / 2 * decelerate_time;
@@ -408,11 +425,11 @@ public:
 			}
 			if (s<ego_s && other.vs>ego_vs && s+50>ego_s) // cars far away can have funny speed values
 			{
-				double car_dist = ego_s - s - car_length - safety_distance;
+				double car_dist = ego_s - s - car_length - safety_distance - additional_safety_distance_for_lane_change;
 				double speed_diff = other.vs - ego_vs;
 				double decelerate_time = speed_diff / relaxed_acc;
 				if (target_lane == ego_lane) // currently not switching lane, or returning
-					decelerate_time += 3; // we give it more space in case it won't break in time, but once we start lane change, try to finish it
+					decelerate_time += 2; // we give it more space in case it won't break in time, but once we start lane change, try to finish it
 				double min_dist = speed_diff * decelerate_time;
 				if (fLog) fprintf(fLog, "checking car %d behind in lane %d: dist %.2f speed %.2f diff %.2f decelerate time %.2f dist %.2f\n",
 					other.id, other.lane, car_dist, other.vs, speed_diff, decelerate_time, min_dist);
@@ -470,12 +487,32 @@ public:
 	double start_speed;
 	double target_speed;
 	double target_time;
+	SpeedController(double ego_speed)
+	{
+		start_speed = ego_speed;
+		target_speed = max_speed;
+		double delta_to_max_speed = fabs(ego_speed - max_speed);
+		target_time = delta_to_max_speed / relaxed_acc;
+	}
 	double get_speed(double current_t)
 	{
 		double speed;
 		if (current_t > target_time) speed = target_speed;
 		else speed = start_speed + (target_speed - start_speed)*current_t / target_time;
 		return speed;
+	}
+	void add_limit_breakpoint(double new_target_speed, double new_target_time)
+	{
+		// make sure we don't divide by 0:
+		double time_mod = std::max(target_time, 0.02);
+		double new_time_mod = std::max(new_target_time, 0.02);
+		double current_grade = (target_speed - start_speed) / target_time;
+		double new_grade = (new_target_speed - start_speed) / new_target_time;
+		if (new_grade < current_grade)
+		{
+			target_speed =new_target_speed;
+			target_time = new_target_time;
+		}
 	}
 };
 
@@ -1156,7 +1193,7 @@ int main() {
 		  map.project_speed(ego_speed_vector, map.reference_waypoint_id, &ego_vs, &ego_vd);
 		  if (console_log) printf("%04d v% 4.2f a% 4.2f d% 4.2f vd % 4.2f", frame_count, ego_speed, ego_acc, ego_d, ego_vd);
 		  
-		  if (fLog) fprintf(fLog, "%04d v%.2f a%.2f d%.2f\n", frame_count, ego_speed, ego_acc, ego_d);
+		  if (fLog) fprintf(fLog, "#%04d wp%d v%.2f a%.2f d%.2f\n", frame_count, map.reference_waypoint_id, ego_speed, ego_acc, ego_d);
 		  frame_count++;
 
 		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
@@ -1234,30 +1271,22 @@ int main() {
 		  }*/
 		  //vector<double> in_lane_jmt;
 		  //double in_lane_jmt_max_time = 0;
-		  SpeedController speed_controller;
-		  speed_controller.start_speed = ego_speed;
-		  speed_controller.target_speed = max_speed;
-		  double delta_to_max_speed = fabs(ego_speed - max_speed);
-		  speed_controller.target_time = delta_to_max_speed / relaxed_acc;
-
-		  LimitSpeed limit_speed_in_lane, limit_speed_in_target_lane; // during lane change, we may have to adjust speed on 2 cars
+		  SpeedController speed_controller(ego_speed);
+		  
+		  // during lane change, we may have to adjust speed on 2 cars
 		  if (next_car_id != -1)
 		  {
+			  LimitSpeed limit_speed_in_lane;
 			  auto &follow_car = sensor_fusion_cars[next_car_id];
 			  limit_speed_in_lane.calculate(follow_car, next_s, ego_s, ego_speed, ego_acc);
-			  speed_controller.target_speed = limit_speed_in_lane.target_speed;
-			  speed_controller.target_time = limit_speed_in_lane.target_time;
+			  speed_controller.add_limit_breakpoint(limit_speed_in_lane.target_speed, limit_speed_in_lane.target_time);
 		  }
 		  if (next_car_in_target_lane != -1)
 		  {
+			  LimitSpeed limit_speed_in_target_lane;
 			  auto &follow_car = sensor_fusion_cars[next_car_in_target_lane];
 			  limit_speed_in_target_lane.calculate(follow_car, next_s_in_target_lane, ego_s, ego_speed, ego_acc);
-			  // choose the lower:
-			  if (limit_speed_in_target_lane.target_speed < speed_controller.target_speed)
-			  {
-				  speed_controller.target_speed = limit_speed_in_target_lane.target_speed;
-				  speed_controller.target_time = limit_speed_in_target_lane.target_time;
-			  }
+			  speed_controller.add_limit_breakpoint(limit_speed_in_target_lane.target_speed, limit_speed_in_target_lane.target_time);
 		  }
 
 		  //printf(" target %.2f @ %.2f", speed_controller.target_speed, speed_controller.target_time);
