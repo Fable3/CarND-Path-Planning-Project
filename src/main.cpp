@@ -24,8 +24,9 @@ using std::vector;
 #define EPSILON 1e-5
 
 FILE *fLog = NULL;
-bool need_log = true;
-bool console_log = true;
+bool need_log = false;
+bool console_log = false;
+bool sparse_console_log = false;
 
 void error_condition(const char *filename, int line, const char *text)
 {
@@ -487,8 +488,10 @@ public:
 	double start_speed;
 	double target_speed;
 	double target_time;
+	double time_shift; // when acceleration is maximized, shift the linear function to match the calculated speed value
 	SpeedController(double ego_speed)
 	{
+		time_shift = 0;
 		start_speed = ego_speed;
 		target_speed = max_speed;
 		double delta_to_max_speed = fabs(ego_speed - max_speed);
@@ -496,6 +499,9 @@ public:
 	}
 	double get_speed(double current_t)
 	{
+		current_t -= time_shift;
+		if (current_t < 0)
+			current_t = 0;
 		double speed;
 		if (current_t > target_time) speed = target_speed;
 		else speed = start_speed + (target_speed - start_speed)*current_t / target_time;
@@ -506,8 +512,8 @@ public:
 		// make sure we don't divide by 0:
 		double time_mod = std::max(target_time, 0.02);
 		double new_time_mod = std::max(new_target_time, 0.02);
-		double current_grade = (target_speed - start_speed) / target_time;
-		double new_grade = (new_target_speed - start_speed) / new_target_time;
+		double current_grade = (target_speed - start_speed) / time_mod;
+		double new_grade = (new_target_speed - start_speed) / new_time_mod;
 		if (fLog)
 		{
 			if (target_speed != max_speed && new_target_speed != max_speed)
@@ -521,6 +527,20 @@ public:
 			target_speed =new_target_speed;
 			target_time = new_target_time;
 		}
+	}
+	void override_speed(double current_t, double speed)
+	{
+		// modify time_shift to keep the same slope and target speed, but with speed at current_t
+		if (current_t > target_time) return; // zero grade from next step, and also prevents divide by zero
+		//double current_grade = (target_speed - start_speed) / target_time;
+		// get modified current_t from from speed = start_speed + (target_speed - start_speed)*current_t / target_time
+		if (fabs(target_speed - start_speed) < EPSILON) return;
+		// speed - start_speed = (target_speed - start_speed)*current_t / target_time
+		// target_time*(speed-start_speed)/(target_speed-start_speed) = current_t
+		double mod_current_t = target_time * (speed - start_speed) / (target_speed - start_speed);
+		// we reported speed at mod_current_t (like at 1 sec), but we'll report that value at current_t from now on (like 1.4 sec)
+		// then we need to have time_shift = 0.4 sec, so that get_speed(1.4) would return the value for (1.4-0.4) sec
+		time_shift = current_t - mod_current_t;
 	}
 };
 
@@ -881,6 +901,8 @@ public:
 			//double speed = max_speed;
 			//for (int i = 1; i < (int)waypoints.size(); i++)
 			double current_sp_arg = 0;
+			double prev_speed = speed_controller.start_speed;
+			double prev_angle = 0;
 			while (current_sp_arg < 50) // 50 meters max, will stop at 50 points anyway
 			{
 				/*if (!in_lane_jmt.empty() && current_t <= in_lane_jmt_max_time)
@@ -900,14 +922,56 @@ public:
 					printf("\nspline warning, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
 					if (fLog) fprintf(fLog, "spline warning, dist: %.4f, step: %.4f, pos %.2f,%.2f to %.2f,%.2f\n", dist, dist_step, pos_x, pos_y, x, y);
 				}
+
+				// we now have a general direction, just have to update speed or decrease angle change to keep below target acceleration
+				double acceleration = fabs(speed - prev_speed)*50;
+				double angle = atan2(y - pos_y, x - pos_x);
+				double angle_diff = fmod(angle - prev_angle + 3 * pi(), 2 * pi()) - pi();
+				// from: rad_per_sec = speed / min_radius and angle_step = rad_per_sec / 50
+				//double turn_radius = speed / 50 / fabs(angle_diff);
+				// from radius = speed^2/acc -> centrifugal_acceleration = speed * speed / turn_radius
+				// centrifugal_acceleration = speed * speed / speed * 50 * angle_diff;
+				double centrifugal_acceleration = speed * 50 * fabs(angle_diff);
+				if (acceleration + centrifugal_acceleration > maximum_acc)
+				{
+					// need to intervent, either by smoothing the angle or reducing acceleration
+					// reduced acceleration is more simple:
+					double new_acceleration = maximum_acc - centrifugal_acceleration;
+					if (new_acceleration < 0)
+					{
+						if (fLog) fprintf(fLog, "accT too high, accN=%.2f accT=%.2f\n", centrifugal_acceleration, acceleration);
+						new_acceleration = 0;
+					} 
+					
+					double new_speed;
+					if (speed > prev_speed)
+					{
+						new_speed = prev_speed + new_acceleration / 50;
+					}
+					else
+					{
+						new_speed = prev_speed - new_acceleration / 50;
+					}
+					if (fLog) fprintf(fLog, "acceleration override, accN=%.2f accT=%.2f -> %.2f speed %.2f -> %.2f\n", centrifugal_acceleration, acceleration, new_acceleration, speed, new_speed);
+					// reset speed control to new value: (todo)
+					speed_controller.override_speed(current_t, new_speed);
+					speed = new_speed;
+					speed_controller.target_time += 0.02;
+					dist_step = speed / 50;
+				}
+				
 				//if (current_t == 0.02) printf(" next sp %.2f", speed);
 				current_t += 0.02;
+				prev_speed = speed;
+				prev_angle = angle;
 				double sp_step = (x - pos_x)*dist_step / dist;
+				pos_y += (y - pos_y)*dist_step / dist;
 				current_sp_arg += sp_step;
-				y = spline(current_sp_arg);
+				//extra precise spline:
+				//y = spline(current_sp_arg);
+				//pos_y = y;
 				pos_x += sp_step;
-				pos_y = y;
-				//pos_y += (y - pos_y)*dist_step / dist;
+				
 				// transform back:
 				Point tp;
 				tp.x = pos_x * cos_angle - pos_y * sin_angle;
@@ -1194,6 +1258,10 @@ int main() {
 			  printf("Warning! can't lane match ego\n");
 			  ego_s = ego_d = 0;
 			  ego_lane = 0;
+		  }
+		  if (sparse_console_log)
+		  {
+			  console_log = !(frame_count % 50);
 		  }
 		  double ego_vs, ego_vd;
 		  map.project_speed(ego_speed_vector, map.reference_waypoint_id, &ego_vs, &ego_vd);
