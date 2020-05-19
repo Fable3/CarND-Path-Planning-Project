@@ -25,8 +25,8 @@ using std::vector;
 
 FILE *fLog = NULL;
 bool need_log = true;
-bool console_log = true;
-bool sparse_console_log = false;
+bool console_log = false;
+bool sparse_console_log = true;
 bool test_fast_lane_change = false;
 
 void error_condition(const char *filename, int line, const char *text)
@@ -39,7 +39,7 @@ void error_condition(const char *filename, int line, const char *text)
 double relaxed_acc = 5; // m/s^2
 double min_relaxed_acc_while_braking = 4; // m/s^2
 double maximum_jerk = 9;
-double maximum_acc = 7;
+double maximum_acc = 9;
 
 double max_speed = 22.2; // 50 mph
 double car_length = 4.5;
@@ -1265,7 +1265,7 @@ int main() {
 		  double delta_t0 = 0; // time in the future where trajectory planning starts, at the end of kept previous path
 
 		  Point ego_speed_vector;
-		  int prev_trajectory_length = 4; // need 1 for pos, 2 for speed, 3 for acc, 4 for jerk
+		  int prev_trajectory_length = 15; // need 1 for pos, 2 for speed, 3 for acc, 4 for jerk
 		  if ((int)previous_path_x.size() >= prev_trajectory_length)
 		  {
 			  for (int i = 0; i < prev_trajectory_length; i++)
@@ -1273,9 +1273,9 @@ int main() {
 				  Point p(previous_path_x[i], previous_path_y[i]);
 				  prev_trajectory.push_back(p);
 			  }
-			  double v1 = (prev_trajectory[1] - prev_trajectory[0]).length();
-			  double v2 = (prev_trajectory[2] - prev_trajectory[1]).length();
-			  ego_speed_vector = prev_trajectory[3] - prev_trajectory[2];
+			  double v1 = (prev_trajectory[prev_trajectory_length-3] - prev_trajectory[prev_trajectory_length-4]).length();
+			  double v2 = (prev_trajectory[prev_trajectory_length-2] - prev_trajectory[prev_trajectory_length-3]).length();
+			  ego_speed_vector = prev_trajectory[prev_trajectory_length-1] - prev_trajectory[prev_trajectory_length-2];
 			  double v3 = ego_speed_vector.length();
 			  ego_acc = (v3 - v2) * 50;
 			  double prev_acc = (v2 - v1) * 50;
@@ -1283,8 +1283,8 @@ int main() {
 			  ego_speed = v3 * 50;
 			  ego_speed_vector.x *= 50;
 			  ego_speed_vector.y *= 50;
-			  ego_x = prev_trajectory[3].x;
-			  ego_y = prev_trajectory[3].y;
+			  ego_x = prev_trajectory[prev_trajectory_length-1].x;
+			  ego_y = prev_trajectory[prev_trajectory_length-1].y;
 			  delta_t0 = prev_trajectory_length / 50.0;
 		  }
 		  else

@@ -14,6 +14,8 @@ After tweaking with lane score weights, the 30 minutes performance improved to 2
 
 ![30min_improved.png](30min_improved.png)
 
+[![Completed lap](https://img.youtube.com/vi/dkDTlqoc6KE/0.jpg)](https://www.youtube.com/watch?v=dkDTlqoc6KE)
+
 ### Overview
 
 The trajectory is recalculated in every frame. A few points is kept from the previous trajectory to maintain continuity, the rest is discarded.
