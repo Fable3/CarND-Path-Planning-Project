@@ -14,6 +14,10 @@ After tweaking with lane score weights, the 30 minutes performance improved to 2
 
 ![30min_improved.png](30min_improved.png)
 
+The final code running for an hour:
+
+![60min_test.png](60min_test.png)
+
 Here's a recorded lap on Youtube:
 
 [![Completed lap](thumbnail.png)](https://www.youtube.com/watch?v=dkDTlqoc6KE)
@@ -23,11 +27,11 @@ Here's a recorded lap on Youtube:
 The trajectory is recalculated in every frame. A few points is kept from the previous trajectory to maintain continuity, the rest is discarded.
 While this causes a lot of trouble with Spline or JMT, the ego vehicle has a much better response time, and it's more realistic.
 
-The Frenet transformation is not linar. When the road curves left, cars in the right lane have to travel more distance.
+The Frenet transformation is not linear. When the road curves left, cars in the right lane have to travel more distance.
 The default implementation overcomes this issue by jumping through the gap, so the "s" function is not continuous.
 I've implemented a different approach, where the Frenet coordinate system is centered on the ego vehicle, and the "s" coordinate is continuous, but it's not precise for far objects.
 
-For trajectory generation, I use the spline library. Only 3 points are used from the previous trajectory, expanded backwards lineraly for 3 meters to make it smoother. Forward direction I add points which are on the target lane centerline.
+For trajectory generation, I use the spline library. 10 points are used from the previous trajectory, then add points on the target lane centerline.
 
 The speed is controlled by surrounding cars of the environmental model, referenced as "sensor fusion". The trajectory planner receives a target speed and a time to reach that speed.
 
@@ -56,7 +60,7 @@ This is usually the same car, because even during lane change, the car in the ta
 The `delta_t0` here is the timestamp of the end of our used previous trajectory, so the trajectory calculation starts at this timestamp in the near future.
 Except for startup, it's 0.2, which is also the minimum reaction time of the system.
 
-`LimitSpeed` is called for the car we're following, or both, if there're 2 of them. Based on the distance and speed difference, a target speed and target time is calculated.
+`LimitSpeed` is called for the car we're following, and also for the next car ahead in target lane during lane change. Based on the distance and speed difference, a target speed and target time is calculated.
 
 `SpeedController` is for handling a simple speed profile. A target speed is reached at a target time, linearly changing speed over time, and that speed is maintained after that.
 It's set up with the `LimitSpeed` output and used by `TrajectoryBuilder`.
@@ -156,6 +160,9 @@ A simple class to handle constant acceleration.
 `add_limit_breakpoint` is for mixing different speed targets, picking the one with the lower gradient, which means less accelerating or more braking.
 Used when following a car in an adjacent lane, but there's also an in-lane car ahead.
 
+`override_speed` is for keeping total acceleration under control.
+If the provided speed cannot be reached due to total acceleration limit, the target time is shifted further away while keeping the original gradient.
+
 #### TrajectoryBuilder
 
 The trajectory is normally the result of a spline function. The control points of the spline can come from 4 sources:
@@ -191,7 +198,10 @@ Limiting lane change would not give guarantee to acceleration either.
 As it turned out, the only way to limit acceleration was to measure and control it.
 
 Acceleration has two components: speed change and centrifugal acceleration.
+
 First, I reduce the acceleration from positive speed change, so the car would no try to accelerate in a curve.
+The `SpeedController` gets the feedback of the updated speed to maintain its original gradient.
+
 Then I reduce the centrigual acceleration by straightening out the curve.
 Basically, I calculate an angle difference which would make the total acceleration equal to maximum acceleration, and modify the transformation angle with this value.
 The rotation center of the transformation also has to be updated.
