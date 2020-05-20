@@ -214,7 +214,7 @@ This class calculates speed for in-lane driving. There are 4 different cases to 
 Assuming similar deceleration capabilities, the ego vehicle is safe if it can decelerate to the same speed and position as the car in front.
 - "Braking" uses the same concept, but with relaxed acceleration value. Once the car started braking, an even lower deceleration threshold value is used to maintain constant light braking.
 - "Adjust" is used when the ego vehicle is close to the car ahead, it calculates a speed to reach optimal distance in 1 second.
--"Keep" is used when in that 0.5 meter range of keep_distance_leeway, where speed adjustment is not necessary, the target speed is the same as the car's ahead.
+- "Keep" is used when in that 0.5 meter range of keep_distance_leeway, where speed adjustment is not necessary, the target speed is the same as the car's ahead.
 
 "Adjust" and "Keep" is switched off for cars in adjacent lanes, it caused braking during lane change, which didn't look good.
 When the space is tight, the ego car should squeeze in first, only keeping safety distance, and then try to maintain a comfortable distance afterwards.
