@@ -24,9 +24,9 @@ using std::vector;
 #define EPSILON 1e-5
 
 FILE *fLog = NULL;
-bool need_log = true;
+bool need_log = false;
 bool console_log = false;
-bool sparse_console_log = true;
+bool sparse_console_log = false;
 bool test_fast_lane_change = false;
 
 void error_condition(const char *filename, int line, const char *text)
@@ -38,8 +38,9 @@ void error_condition(const char *filename, int line, const char *text)
 
 double relaxed_acc = 5; // m/s^2
 double min_relaxed_acc_while_braking = 4; // m/s^2
-double maximum_jerk = 9;
-double maximum_acc = 9;
+//double maximum_jerk = 9;
+double maximum_acc = 8;
+
 
 double max_speed = 22.2; // 50 mph
 double car_length = 4.5;
@@ -575,7 +576,7 @@ public:
 		double pos_y;
 		double angle;
 		vector<Point> result_points = prev_trajectory;
-		vector<Point> pre_trajectory_spline_control_points;
+		//vector<Point> pre_trajectory_spline_control_points;
 		Point pre_trajectory_start_pos(ego_x, ego_y);
 
 
@@ -627,16 +628,16 @@ public:
 			v_pre.y = -sin(angle);
 		}
 		
-		for (int i = 3; i >=1; i--)
+		/*for (int i = 3; i >=1; i--)
 		{
 			pre_trajectory_spline_control_points.push_back(
 				Point(pre_trajectory_start_pos.x + v_pre.x*i*pre_trajectory_point_dist, 
 					pre_trajectory_start_pos.y + v_pre.y*i*pre_trajectory_point_dist));
-		}
+		}*/
 		//printf(" ego yaw %.2f angle %.2f", deg2rad(ego_yaw), angle);
 		add_control_point(Point(pos_x, pos_y)); // startup
 
-		double min_control_point_dist = speed_controller.start_speed * 1.5;
+		double min_control_point_dist = speed_controller.start_speed * 1;
 		min_control_point_dist = std::max(min_control_point_dist, 5.0); // at least 5 m
 		//double first_control_point_dist = min_control_point_dist; // first control point is to switch lane or return to center line
 		double contol_point_start_s = 0;
@@ -721,7 +722,7 @@ public:
 			// if 4 meter, we just start the lane switch, need about 2 seconds
 			// if 6 meter, we might in the middle of an opposite lane change, need about 3 sec
 			//double lane_switch_time = 2.0 * d_diff/4.0+disalignment; // 2 seconds / 4 meter
-			double min_lane_switch_dist = 15.0;
+			double min_lane_switch_dist = 10.0;
 			double speed = speed_controller.start_speed;
 			double dist = speed * lane_switch_time;
 			if (dist < min_lane_switch_dist) dist = min_lane_switch_dist;
@@ -769,8 +770,8 @@ public:
 		if (fLog)
 		{
 			fprintf(fLog, "first control dist %.2f\n", (Point(pos_x, pos_y) - control_points[1]).length());
-			fprintf(fLog, "pre_control=[");
-			for (int i = 0; i < pre_trajectory_spline_control_points.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", pre_trajectory_spline_control_points[i].x, pre_trajectory_spline_control_points[i].y);
+			//fprintf(fLog, "pre_control=[");
+			//for (int i = 0; i < pre_trajectory_spline_control_points.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", pre_trajectory_spline_control_points[i].x, pre_trajectory_spline_control_points[i].y);
 			fprintf(fLog, "]\n");
 			fprintf(fLog, "prev_trajectory=[");
 			for (int i = 0; i < prev_trajectory.size(); i++) fprintf(fLog, "%s[%.4f,%.4f]", i == 0 ? "" : ",", prev_trajectory[i].x, prev_trajectory[i].y);
@@ -795,7 +796,7 @@ public:
 			p.y = ty;
 		}
 		vector<double> wp_x, wp_y;
-		for (int i = 0; i < (int)pre_trajectory_spline_control_points.size(); i++)
+		/*for (int i = 0; i < (int)pre_trajectory_spline_control_points.size(); i++)
 		{
 			Point &p = pre_trajectory_spline_control_points[i];
 			p = p - transform_center;
@@ -803,7 +804,7 @@ public:
 			double ty = p.x*sin_angle + p.y*cos_angle;
 			wp_x.push_back(tx);
 			wp_y.push_back(ty);
-		}
+		}*/
 		for (int i = 0; i < int(prev_trajectory.size()) - 1; i++)
 		{
 			Point &p = prev_trajectory[i];
@@ -936,6 +937,7 @@ public:
 				// from radius = speed^2/acc -> centrifugal_acceleration = speed * speed / turn_radius
 				// centrifugal_acceleration = speed * speed / speed * 50 * angle_diff;
 				double centrifugal_acceleration = speed * 50 * fabs(angle_diff);
+				//if (fLog) fprintf(fLog, "angle at %d: %.4f diff: %.4f acc: %.2f\n", result_points.size(), angle_step, angle_diff, centrifugal_acceleration);
 				if (acceleration + centrifugal_acceleration > maximum_acc)
 				{
 					// need to intervent, either by smoothing the angle or reducing acceleration
@@ -976,11 +978,15 @@ public:
 							if (fLog) fprintf(fLog, "accN too high (overbraking?), accN=%.2f accT=%.2f\n", centrifugal_acceleration, acceleration);
 							new_centrifugal_acceleration = 0;
 						}
-						if (fLog) fprintf(fLog, "adjusting curvature for pt %d, accN=%.2f -> %.2f accT=%.2f\n", result_points.size(), centrifugal_acceleration, new_centrifugal_acceleration, acceleration);
+						
 						// from double centrifugal_acceleration = speed * 50 * fabs(angle_diff);
 						double new_angle_diff = new_centrifugal_acceleration / speed / 50;
 						if (angle_diff < 0) new_angle_diff *= -1;
-						double new_angle = angle_step + angle_diff;
+						double new_angle = angle_step + new_angle_diff;
+						double rot_angle = new_angle_diff - angle_diff;
+
+						if (fLog) fprintf(fLog, "adjusting curvature for pt %d, accN=%.2f -> %.2f accT=%.2f, angle %.4f->%.4f, diff %.4f->%.4f, rot angle %.4f\n",
+							result_points.size(), centrifugal_acceleration, new_centrifugal_acceleration, acceleration, angle_step, new_angle, angle_diff, new_angle_diff, rot_angle);
 						// need to recalculate transform center, 
 						// rotate around pos_x and pos_y with new_angle_diff, 
 						// and calculate new transform center with transform_angle+new_angle_diff going through pos_x, pos_y
@@ -993,10 +999,10 @@ public:
 						// rotate transform center around tp:
 						Point vect = transform_center - tp;
 						Point rotated_vect;
-						rotated_vect.x = vect.x*cos(new_angle_diff) - vect.y*sin(new_angle_diff);
-						rotated_vect.y = vect.x*sin(new_angle_diff) + vect.y*cos(new_angle_diff);
+						rotated_vect.x = vect.x*cos(rot_angle) - vect.y*sin(rot_angle);
+						rotated_vect.y = vect.x*sin(rot_angle) + vect.y*cos(rot_angle);
 						transform_center = tp + rotated_vect;
-						transform_angle += new_angle_diff;
+						transform_angle += rot_angle;
 						cos_angle = cos(transform_angle);
 						sin_angle = sin(transform_angle);
 						// just testing, pos_x, posy should be the same:
@@ -1059,7 +1065,7 @@ public:
 			target_time = min_time;
 		}
 	}
-	void calculate(Car &follow_car, double next_s, double ego_s, double ego_speed, double ego_acc)
+	void calculate(Car &follow_car, double next_s, double ego_s, double ego_speed, double ego_acc, bool in_lane)
 	{
 		target_speed = max_speed;
 		double delta_to_max_speed = fabs(ego_speed - max_speed);
@@ -1108,16 +1114,16 @@ public:
 				can_accelerate = false;
 			}
 		}
-		if (can_accelerate) // maintain safe distance
+		if (can_accelerate && in_lane) // maintain safe distance
 		{
-			double t_to_reach_optimal_distance = 1; // sec
+			double excess_distance = ego_s + car_length + keep_distance - next_s; // negative when approaching
+			double velocity_difference_for_adjusting = 1.0;
+			double t_to_reach_optimal_distance = std::min(1.0, fabs(excess_distance)/ velocity_difference_for_adjusting); // sec
 			double follow_car_predicted_pos = follow_car_speed * t_to_reach_optimal_distance + next_s;
 			double ego_car_predicted_pos = ego_speed * t_to_reach_optimal_distance + ego_s;
 
 			if (ego_s + car_length + keep_distance > next_s)
 			{
-				double excess_distance = ego_s + car_length + keep_distance - next_s; // negative when approaching
-
 				target_speed = follow_car_speed - excess_distance / t_to_reach_optimal_distance;
 				target_time = t_to_reach_optimal_distance;
 				maximize_acc(ego_speed, relaxed_acc);
@@ -1185,10 +1191,6 @@ int main() {
   }
   Map map;
   map.Init(map_waypoints_x, map_waypoints_y);
-  double prev_car_speed = 0;
-  double prev_car_acc = 0;
-  bool prev_speed_valid = false;
-  bool prev_acc_valid = false;
   std::map<int, Car> sensor_fusion_cars;
   int target_lane = 1;
 
@@ -1209,7 +1211,7 @@ int main() {
   int frame_count = 0;
   bool lane_change_complete = true;
 
-  h.onMessage([&map, &prev_car_speed, &prev_speed_valid, &prev_car_acc, &prev_acc_valid, &sensor_fusion_cars, &target_lane, &lane_change_complete, &frame_count]
+  h.onMessage([&map, &sensor_fusion_cars, &target_lane, &lane_change_complete, &frame_count]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -1237,19 +1239,7 @@ int main() {
 		  ego_speed /= 2.237;
 		  double ego_acc=0, ego_jerk=0;
 
-		  if (prev_speed_valid)
-		  {
-			  ego_acc = (ego_speed - prev_car_speed) * 50;
-			  if (prev_acc_valid)
-			  {
-				  ego_jerk = (ego_acc - prev_car_acc) * 50;
-			  }
-			  prev_car_acc = ego_acc;
-			  prev_acc_valid = true;
-		  }
-		  prev_car_speed = ego_speed;
-		  prev_speed_valid = true;
-
+		  
 		  // doesn't work from car speed, end of prev path would be better
 		  ego_acc = 0;
 		  ego_jerk = 0;
@@ -1265,21 +1255,24 @@ int main() {
 		  double delta_t0 = 0; // time in the future where trajectory planning starts, at the end of kept previous path
 
 		  Point ego_speed_vector;
-		  int prev_trajectory_length = 15; // need 1 for pos, 2 for speed, 3 for acc, 4 for jerk
+		  int prev_trajectory_length = 10; // need 1 for pos, 2 for speed, 3 for acc, 4 for jerk
+		  // jerk is not handled, but we still need more points in case the simulator sends out telemetry, then processes multiple trajectory points,
+		  // and then it receives the calculated trajectory which does not have any common point anymore
 		  if ((int)previous_path_x.size() >= prev_trajectory_length)
 		  {
+			  //testing purposes: prev_trajectory_length = previous_path_x.size();
 			  for (int i = 0; i < prev_trajectory_length; i++)
 			  {
 				  Point p(previous_path_x[i], previous_path_y[i]);
 				  prev_trajectory.push_back(p);
 			  }
-			  double v1 = (prev_trajectory[prev_trajectory_length-3] - prev_trajectory[prev_trajectory_length-4]).length();
+			  //double v1 = (prev_trajectory[prev_trajectory_length-3] - prev_trajectory[prev_trajectory_length-4]).length();
 			  double v2 = (prev_trajectory[prev_trajectory_length-2] - prev_trajectory[prev_trajectory_length-3]).length();
 			  ego_speed_vector = prev_trajectory[prev_trajectory_length-1] - prev_trajectory[prev_trajectory_length-2];
 			  double v3 = ego_speed_vector.length();
 			  ego_acc = (v3 - v2) * 50;
-			  double prev_acc = (v2 - v1) * 50;
-			  ego_jerk = (ego_acc - prev_acc) * 50;
+			  //double prev_acc = (v2 - v1) * 50;
+			  //ego_jerk = (ego_acc - prev_acc) * 50;
 			  ego_speed = v3 * 50;
 			  ego_speed_vector.x *= 50;
 			  ego_speed_vector.y *= 50;
@@ -1325,8 +1318,8 @@ int main() {
 
 		  if (ego_acc > maximum_acc) ego_acc = maximum_acc; // don't try to limit jerk if acc is too high anyway
 		  if (ego_acc < -maximum_acc) ego_acc = -maximum_acc;
-		  if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
-		  if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
+		  //if (ego_jerk > maximum_jerk) ego_jerk = maximum_jerk;
+		  //if (ego_jerk < -maximum_jerk) ego_jerk = -maximum_jerk;
 
 
 		  for (int i = 0; i < (int)sensor_fusion.size(); i++)
@@ -1355,9 +1348,12 @@ int main() {
 
 			  }
 		  }
-
+		  
 		  LaneChangePlanner lane_change_planner;
-		  target_lane = lane_change_planner.calculate_target_lane(sensor_fusion_cars, ego_lane, target_lane, ego_s, ego_vs, delta_t0);
+		  //if (lane_change_complete) // this can prevent sudden lane changes, and aborted lane changes, but it's a reliability
+		  {
+			  target_lane = lane_change_planner.calculate_target_lane(sensor_fusion_cars, ego_lane, target_lane, ego_s, ego_vs, delta_t0);
+		  }
 		  // check if we're off center to the other direction:
 		  if (target_lane != ego_lane)
 		  {
@@ -1430,14 +1426,14 @@ int main() {
 		  {
 			  LimitSpeed limit_speed_in_lane;
 			  auto &follow_car = sensor_fusion_cars[next_car_id];
-			  limit_speed_in_lane.calculate(follow_car, next_s, ego_s, ego_speed, ego_acc);
+			  limit_speed_in_lane.calculate(follow_car, next_s, ego_s, ego_speed, ego_acc, true);
 			  speed_controller.add_limit_breakpoint(limit_speed_in_lane.target_speed, limit_speed_in_lane.target_time);
 		  }
 		  if (next_car_in_target_lane != -1)
 		  {
 			  LimitSpeed limit_speed_in_target_lane;
 			  auto &follow_car = sensor_fusion_cars[next_car_in_target_lane];
-			  limit_speed_in_target_lane.calculate(follow_car, next_s_in_target_lane, ego_s, ego_speed, ego_acc);
+			  limit_speed_in_target_lane.calculate(follow_car, next_s_in_target_lane, ego_s, ego_speed, ego_acc, false);
 			  speed_controller.add_limit_breakpoint(limit_speed_in_target_lane.target_speed, limit_speed_in_target_lane.target_time);
 		  }
 

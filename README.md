@@ -22,7 +22,6 @@ Here's a recorded lap on Youtube:
 
 The trajectory is recalculated in every frame. A few points is kept from the previous trajectory to maintain continuity, the rest is discarded.
 While this causes a lot of trouble with Spline or JMT, the ego vehicle has a much better response time, and it's more realistic.
-The safety and following distances are very low to showcase this behavior.
 
 The Frenet transformation is not linar. When the road curves left, cars in the right lane have to travel more distance.
 The default implementation overcomes this issue by jumping through the gap, so the "s" function is not continuous.
@@ -35,14 +34,18 @@ The speed is controlled by surrounding cars of the environmental model, referenc
 Lane change is determined by a scoring function, it's based on closest car distance, lane distance, and speed of traffic.
 Some lanes may be blocked by cars, even fast approaching ones or slow cars ahead.
 
+### Using previous trajectory
+
+In theory, keeping only 4 points from the previous trajectory would be enough. One point gives position, two velocity, acceleration from three, and 4th is needed to check jerk.
+However, it seems to me that sometimes the simulator would report high acceleration when there's a task switch, or anything that could cause lag.
+I think the reason is that the simulator can process multiple trajectory points by the time the new trajectory is available, and they might not have common point if the reused trajectory is too short.
+For this reason I raised the value to 10, which can compensate 0.2 second lag, but also increases the reaction time of the ego vehicle.
+
 ### Trajectory Calculation Steps
 
-The entry point is in the main::onMessage function. The ego car properties are calculated from the previous trajectory, because our starting point is at the 4th point.
-This is the minimum number to calculate the jerk value, which is the change in acceleration.
-One point gives position, two velocity, acceleration from three, and 4th is needed to check jerk.
-Acceleration value is used for continuous braking. Jerk would be useful for jerk control, but it's not used.
+The entry point is in the main::onMessage function. The ego car properties are calculated from the previous trajectory, because our starting point is at the 10th point.
 
-Ego vehicle and sensor fusion data is matched to the lane centerlines of the map to find their lane, and recalculate the Frenet coordinates with the more precise system.
+Ego vehicle and sensor fusion data are matched to the lane centerlines of the map to find their lane, and recalculate the Frenet coordinates with the more precise system.
 Speed vector is projected to the waypoint segment with `map.project_speed` to get the `vs` and `vd` values in Frenet.
 
 `LaneChangePlanner` calculates a single `target_lane`, which is always adjacent to the current lane.
@@ -51,7 +54,7 @@ Next, I check for the closest car ahead, and also the closest car in the target 
 This is usually the same car, because even during lane change, the car in the target lane would overlap in `d` axis with the ego vehicle, but it's important when starting lane change to follow a slower car.
 
 The `delta_t0` here is the timestamp of the end of our used previous trajectory, so the trajectory calculation starts at this timestamp in the near future.
-Except for startup, it's 0.08, which is also the minimum reaction time of the system.
+Except for startup, it's 0.2, which is also the minimum reaction time of the system.
 
 `LimitSpeed` is called for the car we're following, or both, if there're 2 of them. Based on the distance and speed difference, a target speed and target time is calculated.
 
@@ -85,21 +88,21 @@ double min_relaxed_acc_while_braking = 4; // m/s^2
 Once a relaxed breaking starts, this thresholded value makes sure to continue braking, instead of braking pulses.
 
 ```
-double maximum_jerk = 9;
 double maximum_acc = 8;
 ```
-Maximum values, but only for "s" coordinate, so during lane change, the total acceleration can go above this value. With 8 instead of 10, the car can run for an hour without problem.
-
+This is the total maximum value, the sum of breaking deceleration and centrifugal acceleration.
 
 ```
 double max_speed = 22.2; // 50 mph
 double car_length = 4.5;
 double safety_distance = 2;
-double keep_distance = 5;
+double keep_distance = 10;
 double keep_distance_leeway = 0.5; // when following, match car in front speed if in this range
 ```
 These values are for speed control. Inside safety distance, hard breaking is necessary instead of relaxed braking.
 When following a car in lane, the distance is maintained between `keep_distance` and `keep_distance+keep_distance_leeway`.
+The `keep_distance` could be much lower, I increased it to reviewer's request, as it didn't look human-like.
+It is true, in real life, the driver ahead would freak out.
 
 #### The Map class
 
@@ -146,19 +149,22 @@ This can result in switching to middle lane even if it's score is low, it just h
 
 #### SpeedController
 
-A simple class to handle constant acceleration. `get_speed` returns the speed as a function of time, depending on the ego vehicle speed and the target speed, which can be result of braking.
+A simple class to handle constant acceleration.
+
+`get_speed` returns the speed as a function of time, depending on the ego vehicle speed and the target speed, which can be result of braking.
+
+`add_limit_breakpoint` is for mixing different speed targets, picking the one with the lower gradient, which means less accelerating or more braking.
+Used when following a car in an adjacent lane, but there's also an in-lane car ahead.
 
 #### TrajectoryBuilder
 
-The trajectory is normally the result of a spline function. The control points of the spline come from 4 sources:
+The trajectory is normally the result of a spline function. The control points of the spline can come from 4 sources:
 - pre-trajectory, these are point in the past, linear extension of the first vector of the previous trajectory (magenta on the picture above)
-- previous trajectory, 4 points from there, the zero point is the last one. These points are also the starting points of the result point list. (cyan)
+- previous trajectory, the zero point is the last one. These points are also the starting points of the result point list. (cyan)
 - if there's no previous trajectory, the ego vehicle position
 - control points on the target lane center line (red, continues under yellow)
 
-The extra points in the past were necessary for shaping the spline.
-The few points from the previous trajectory sometimes weren't enough to properly shape the start of the trajectory, which is the most important part.
-The rest of the trajectory is recalculated in the next cycle.
+The picture was taken with 4 previous trajectory point, I later increased it to 10 and removed the now-obsolete pre-trajectory control points. The extra points in the past were necessary for shaping the spline.
 
 The next control point distance depends on the speed and in case lane change, the perpendicular speed (`vd`).
 This is necessary because an impossible control point can generate a spline with a lot of acceleration and jerk.
@@ -168,12 +174,30 @@ The d-wise speed component is the opposite of the target lane direction. First, 
 For the spline generation, all control point coordinates are shifted to the end of the previous trajectory, and rotated to 0 angle.
 The spline function returns `y` values for any `x` value, so it has to be horizontal.
 The `x` value is chosen at the step distance, but the resulting `x,y` coordinate would be farther away.
-To compensate this, the more precise `sp_step` value is then calculated by using the `x,y` distance and `x` as a ratio. The corrected `y` value is measured at the new argument.
-This method works better when the spline is degenerate, and turns close to vertical. Normally it doesn't happen.
+To compensate this, the more precise `sp_step` and `y` value is then calculated by using the `x,y` distance and `x` or `y` as a ratio.
 
 When the car goes offroad, the spline function might fail. For this event, a backup trajectory generator is used, based on car angle.
 There are some calculations for maximum angle difference based on speed, this is the same physics as the curvature dependent speed calculation.
 Only ever used when the car goes offroad, so it's just for completeness.
+
+#### Acceleration control
+
+The spline function does not guarantee maximum acceleration, it only tries to minimize centrifugal acceleration. 
+The resulting `x,y` coordinates might still go over the requirements, and it's very random.
+I could run the simulator for an hour relying on spline, but for the reviewer a sudden lane changes caused high acceleration in 3 minutes.
+I did stress testing, continuously doing sudden lane changes.
+The worst scenario is changing lane to left at high speed in a left curve, while also braking.
+Limiting lane change would not give guarantee to acceleration either.
+As it turned out, the only way to limit acceleration was to measure and control it.
+
+Acceleration has two components: speed change and centrifugal acceleration.
+First, I reduce the acceleration from positive speed change, so the car would no try to accelerate in a curve.
+Then I reduce the centrigual acceleration by straightening out the curve.
+Basically, I calculate an angle difference which would make the total acceleration equal to maximum acceleration, and modify the transformation angle with this value.
+The rotation center of the transformation also has to be updated.
+
+If I would want to use it in a real car, I'd make sure to choose wisely between reducing braking and straightening out the curve.
+Multiple trajectories could be calculated and checked for less impact.
 
 #### LimitSpeed
 
@@ -186,6 +210,9 @@ Assuming similar deceleration capabilities, the ego vehicle is safe if it can de
 "Adjust" is used when the ego vehicle is close to the car ahead, it calculates a speed to reach optimal distance in 1 second.
 
 "Keep" is used when in that 0.5 meter range of keep_distance_leeway, where speed adjustment is not necessary, the target speed is the same as the car's ahead.
+
+"Adjust" and "Keep" is switched off for cars in adjacent lanes, it caused braking during lane change, which didn't look good.
+When the space is tight, the ego car should squeeze in first, only keeping safety distance, and then try to maintain a comfortable distance afterwards.
 
 #### Debugging tool
 
