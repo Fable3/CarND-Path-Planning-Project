@@ -10,9 +10,7 @@ Here's a short gif about a random lane change.
 ![lane change](passing_sample.gif)
 
 I've measured the distance over 30 minutes to see the performance of the algorithm. With conservative paramters (only changing lane when there was a significant advantage), the [result](30min.png) was 20.71 miles.
-After tweaking with lane score weights, the 30 minutes performance improved to 24.52 miles:
-
-![30min_improved.png](30min_improved.png)
+After tweaking with lane score weights, the [30 minutes performance improved](30min_improved.png) to 24.52 miles:
 
 The final code running for an hour:
 
@@ -212,14 +210,11 @@ Multiple trajectories could be calculated and checked for less impact.
 #### LimitSpeed
 
 This class calculates speed for in-lane driving. There are 4 different cases to limit the speed:
-"Maxbraking" occurs if the car ahead is too close to approach with relaxed deceleration.
+- "Maxbraking" occurs if the car ahead is too close to approach with relaxed deceleration.
 Assuming similar deceleration capabilities, the ego vehicle is safe if it can decelerate to the same speed and position as the car in front.
-
-"Braking" uses the same concept, but with relaxed acceleration value. Once the car started braking, an even lower deceleration threshold value is used to maintain constant light braking.
-
-"Adjust" is used when the ego vehicle is close to the car ahead, it calculates a speed to reach optimal distance in 1 second.
-
-"Keep" is used when in that 0.5 meter range of keep_distance_leeway, where speed adjustment is not necessary, the target speed is the same as the car's ahead.
+- "Braking" uses the same concept, but with relaxed acceleration value. Once the car started braking, an even lower deceleration threshold value is used to maintain constant light braking.
+- "Adjust" is used when the ego vehicle is close to the car ahead, it calculates a speed to reach optimal distance in 1 second.
+-"Keep" is used when in that 0.5 meter range of keep_distance_leeway, where speed adjustment is not necessary, the target speed is the same as the car's ahead.
 
 "Adjust" and "Keep" is switched off for cars in adjacent lanes, it caused braking during lane change, which didn't look good.
 When the space is tight, the ego car should squeeze in first, only keeping safety distance, and then try to maintain a comfortable distance afterwards.
